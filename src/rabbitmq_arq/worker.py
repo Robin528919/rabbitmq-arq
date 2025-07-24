@@ -199,6 +199,10 @@ class Worker(WorkerUtils):
         self._burst_start_time: datetime | None = None
         self._burst_check_task: asyncio.Task | None = None
         self._burst_should_exit = False
+        
+        # 延迟机制标志
+        self._use_delayed_exchange = False
+        self._delayed_exchange_name = f"delayed.{self.rabbitmq_settings.rabbitmq_queue}"
 
     async def _init(self):
         """
@@ -226,17 +230,10 @@ class Worker(WorkerUtils):
         # 声明死信队列
         await self.dlq_channel.declare_queue(self.rabbitmq_dlq, durable=True)
         
-        # 声明延迟队列（TTL队列，过期后路由到主队列）
-        await self.channel.declare_queue(
-            self.delay_queue,
-            durable=True,
-            arguments={
-                'x-dead-letter-exchange': '',  # 默认交换机
-                'x-dead-letter-routing-key': self.rabbitmq_queue  # 路由到主队列
-            }
-        )
+        # 检测并配置延迟队列策略
+        await self._setup_delay_mechanism()
         
-        logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}, 延迟队列: {self.delay_queue}")
+        logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}")
 
     async def on_message(self, message: IncomingMessage):
         """
@@ -472,28 +469,91 @@ class Worker(WorkerUtils):
 
     async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float):
         """
-        将任务发送到延迟队列，使用 TTL + Dead Letter Exchange 实现延迟
+        将任务发送到延迟队列，自动选择最佳延迟机制
         """
         # 清除延迟时间，避免循环延迟
         job.defer_until = None
         
         # 序列化任务
         message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
+        headers = {"x-retry-count": job.job_try - 1}
         
-        # 使用 timedelta 对象作为 expiration（aio-pika 接受的类型）
-        expiration = timedelta(seconds=delay_seconds)
-        
-        # 发送到延迟队列，设置 TTL
-        await self.channel.default_exchange.publish(
-            Message(
-                body=message_body,
-                headers={"x-retry-count": job.job_try - 1},
-                expiration=expiration  # 使用 timedelta 对象
-            ),
-            routing_key=self.delay_queue
-        )
-        
-        logger.info(f"任务 {job.job_id} 已发送到延迟队列，将在 {delay_seconds:.1f} 秒后重新处理")
+        if self._use_delayed_exchange:
+            # 使用延迟插件（更优雅的方案）
+            # 延迟时间通过 x-delay 头设置（毫秒）
+            delay_ms = int(delay_seconds * 1000)
+            headers['x-delay'] = delay_ms
+            
+            # 获取延迟交换机
+            delayed_exchange = await self.channel.get_exchange(self._delayed_exchange_name)
+            
+            # 发送到延迟交换机
+            await delayed_exchange.publish(
+                Message(
+                    body=message_body,
+                    headers=headers
+                ),
+                routing_key=self.rabbitmq_queue
+            )
+            
+            logger.info(f"任务 {job.job_id} 已通过延迟交换机发送，将在 {delay_seconds:.1f} 秒后处理")
+            
+        else:
+            # 使用 TTL + DLX 方案（降级方案）
+            expiration = timedelta(seconds=delay_seconds)
+            
+            # 发送到 TTL 延迟队列
+            await self.channel.default_exchange.publish(
+                Message(
+                    body=message_body,
+                    headers=headers,
+                    expiration=expiration  # TTL 设置
+                ),
+                routing_key=self.delay_queue
+            )
+            
+            logger.info(f"任务 {job.job_id} 已通过 TTL 队列发送，将在 {delay_seconds:.1f} 秒后处理")
+
+    async def _setup_delay_mechanism(self):
+        """
+        检测并设置延迟机制：优先使用延迟插件，其次使用 TTL + DLX
+        """
+        try:
+            # 尝试声明延迟交换机（需要 rabbitmq_delayed_message_exchange 插件）
+            delayed_exchange = await self.channel.declare_exchange(
+                self._delayed_exchange_name,
+                type='x-delayed-message',  # 特殊的延迟消息类型
+                durable=True,
+                arguments={
+                    'x-delayed-type': 'direct'  # 实际的路由类型
+                }
+            )
+            
+            # 绑定延迟交换机到主队列
+            queue = await self.channel.get_queue(self.rabbitmq_queue)
+            await queue.bind(delayed_exchange, routing_key=self.rabbitmq_queue)
+            
+            self._use_delayed_exchange = True
+            logger.info("✅ 检测到 RabbitMQ 延迟插件，使用延迟交换机模式")
+            
+        except Exception as e:
+            # 插件未安装或声明失败，降级到 TTL + DLX 方案
+            logger.warning(f"⚠️ 未检测到 RabbitMQ 延迟插件: {e}")
+            logger.warning("💡 推荐安装 rabbitmq_delayed_message_exchange 插件以获得更好的延迟队列性能")
+            logger.warning("   安装命令: rabbitmq-plugins enable rabbitmq_delayed_message_exchange")
+            logger.info("📌 降级使用 TTL + Dead Letter Exchange 方案")
+            
+            # 声明 TTL 延迟队列
+            await self.channel.declare_queue(
+                self.delay_queue,
+                durable=True,
+                arguments={
+                    'x-dead-letter-exchange': '',  # 默认交换机
+                    'x-dead-letter-routing-key': self.rabbitmq_queue  # 路由到主队列
+                }
+            )
+            
+            self._use_delayed_exchange = False
 
 
 

@@ -173,7 +173,10 @@ async def unreliable_task(ctx: JobContext, url: str):
 
 ### 延迟任务（企业级实现）
 
-RabbitMQ-ARQ 使用 **RabbitMQ TTL + Dead Letter Exchange** 实现真正的非阻塞延迟队列：
+RabbitMQ-ARQ 智能选择最佳延迟机制：
+
+1. **优先使用 RabbitMQ 延迟插件** - 如果安装了 `rabbitmq_delayed_message_exchange`
+2. **降级到 TTL + DLX 方案** - 如果插件未安装，自动使用备选方案
 
 ```python
 # 延迟任务示例
