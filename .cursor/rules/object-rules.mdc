@@ -1,0 +1,8 @@
+---
+alwaysApply: true
+---
+
+1、使用 Python 3.12 特性，类型注解清晰
+2、使用最新的 Pydantic V2 进行数据验证
+3、完全基于 asyncio
+4、代码注释 中文
