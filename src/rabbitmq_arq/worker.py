@@ -275,7 +275,7 @@ class Worker(WorkerUtils):
             # 调用 on_job_start 钩子
             if self.on_job_start:
                 # 传递任务上下文和 Worker 统计信息
-                hook_ctx = job_ctx.dict()
+                hook_ctx = job_ctx.model_dump()
                 hook_ctx['worker_stats'] = {
                     'jobs_complete': self.jobs_complete,
                     'jobs_failed': self.jobs_failed,
@@ -359,7 +359,7 @@ class Worker(WorkerUtils):
             # 调用 on_job_end 钩子
             if self.on_job_end:
                 # 传递任务上下文和更新后的 Worker 统计信息
-                hook_ctx = job_ctx.dict()
+                hook_ctx = job_ctx.model_dump()
                 hook_ctx['worker_stats'] = {
                     'jobs_complete': self.jobs_complete,
                     'jobs_failed': self.jobs_failed,
@@ -370,7 +370,7 @@ class Worker(WorkerUtils):
             
             # 调用 after_job_end 钩子
             if self.after_job_end:
-                hook_ctx = job_ctx.dict()
+                hook_ctx = job_ctx.model_dump()
                 hook_ctx['worker_stats'] = {
                     'jobs_complete': self.jobs_complete,
                     'jobs_failed': self.jobs_failed,
@@ -396,7 +396,7 @@ class Worker(WorkerUtils):
         job.defer_until = datetime.now() + timedelta(seconds=defer_seconds)
         
         # 序列化任务
-        message_body = json.dumps(job.dict(), ensure_ascii=False, default=str).encode()
+        message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
         
         # 发送消息
         await self.channel.default_exchange.publish(

@@ -132,7 +132,7 @@ class RabbitMQClient:
         
         # 序列化任务
         try:
-            message_body = json.dumps(job.dict(), ensure_ascii=False, default=str).encode()
+            message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
         except Exception as e:
             raise SerializationError(f"任务序列化失败: {e}")
         
