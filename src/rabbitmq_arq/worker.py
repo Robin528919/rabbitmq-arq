@@ -218,11 +218,25 @@ class Worker(WorkerUtils):
         # 声明队列
         self.rabbitmq_queue = self.rabbitmq_settings.rabbitmq_queue
         self.rabbitmq_dlq = self.rabbitmq_settings.rabbitmq_dlq
+        self.delay_queue = f"{self.rabbitmq_queue}_delay"
         
+        # 声明主队列
         await self.channel.declare_queue(self.rabbitmq_queue, durable=True)
+        
+        # 声明死信队列
         await self.dlq_channel.declare_queue(self.rabbitmq_dlq, durable=True)
         
-        logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}")
+        # 声明延迟队列（TTL队列，过期后路由到主队列）
+        await self.channel.declare_queue(
+            self.delay_queue,
+            durable=True,
+            arguments={
+                'x-dead-letter-exchange': '',  # 默认交换机
+                'x-dead-letter-routing-key': self.rabbitmq_queue  # 路由到主队列
+            }
+        )
+        
+        logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}, 延迟队列: {self.delay_queue}")
 
     async def on_message(self, message: IncomingMessage):
         """
@@ -243,6 +257,14 @@ class Worker(WorkerUtils):
                 if not self.allow_pick_jobs:
                     logger.warning(f"Worker 正在关闭，拒绝任务: {job_id}")
                     await message.reject(requeue=True)
+                    return
+                
+                # 检查延迟执行时间
+                if job.defer_until and job.defer_until > datetime.now():
+                    delay_seconds = (job.defer_until - datetime.now()).total_seconds()
+                    logger.info(f"任务 {job_id} 需要延迟 {delay_seconds:.1f} 秒执行，发送到延迟队列")
+                    # 发送到延迟队列，不阻塞当前处理
+                    await self._send_to_delay_queue(job, delay_seconds)
                     return
                 
                 # 创建任务并执行
@@ -266,9 +288,22 @@ class Worker(WorkerUtils):
                     await self._send_to_dlq(message.body, headers)
                     logger.error(f"任务 {job_id} 已重试 {retry_count} 次，发送到死信队列")
                 else:
-                    # 重新入队进行重试
-                    await self._requeue_message(message.body, headers, retry_count)
-                    logger.info(f"任务 {job_id} 第 {retry_count} 次重试")
+                    # 使用延迟队列进行重试
+                    try:
+                        # 尝试解析任务，如果解析失败则直接发送到死信队列
+                        job_data = json.loads(message.body.decode())
+                        job = JobModel(**job_data)
+                        job.job_try = retry_count + 1
+                        
+                        # 计算延迟时间（指数退避）
+                        delay_seconds = self.rabbitmq_settings.retry_backoff * (2 ** (retry_count - 1))
+                        
+                        # 发送到延迟队列
+                        await self._send_to_delay_queue(job, delay_seconds)
+                        logger.info(f"任务 {job_id} 第 {retry_count} 次重试，延迟 {delay_seconds:.1f} 秒")
+                    except (json.JSONDecodeError, Exception) as parse_error:
+                        logger.error(f"重试时解析任务失败: {parse_error}，发送到死信队列")
+                        await self._send_to_dlq(message.body, headers)
             
             finally:
                 # 从任务列表中移除
@@ -389,6 +424,12 @@ class Worker(WorkerUtils):
                     'jobs_retried': self.jobs_retried,
                     'jobs_ongoing': len(self.tasks)
                 }
+                # 同步统计数据到全局 ctx（用于关闭钩子）
+                self.ctx['jobs_complete'] = self.jobs_complete
+                self.ctx['jobs_failed'] = self.jobs_failed
+                self.ctx['jobs_retried'] = self.jobs_retried
+                self.ctx['jobs_ongoing'] = len(self.tasks)
+                
                 await self.on_job_end(hook_ctx)
             
             # 调用 after_job_end 钩子
@@ -410,27 +451,15 @@ class Worker(WorkerUtils):
 
     async def _enqueue_job_retry(self, job: JobModel, defer_seconds: float):
         """
-        重新入队任务进行重试
+        重新入队任务进行重试，使用延迟队列
         """
         if job.job_try > self.rabbitmq_settings.max_retries:
             raise MaxRetriesExceeded(f"任务 {job.job_id} 已超过最大重试次数 {self.rabbitmq_settings.max_retries}")
         
-        # 更新延迟执行时间
-        job.defer_until = datetime.now() + timedelta(seconds=defer_seconds)
+        # 使用延迟队列进行重试
+        await self._send_to_delay_queue(job, defer_seconds)
         
-        # 序列化任务
-        message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
-        
-        # 发送消息
-        await self.channel.default_exchange.publish(
-            Message(
-                body=message_body,
-                headers={"x-retry-count": job.job_try - 1}
-            ),
-            routing_key=self.rabbitmq_queue
-        )
-        
-        logger.info(f"任务 {job.job_id} 已重新入队，将在 {defer_seconds} 秒后执行")
+        logger.info(f"任务 {job.job_id} 已发送到延迟队列进行重试，将在 {defer_seconds:.1f} 秒后执行")
 
     async def _send_to_dlq(self, body: bytes, headers: dict[str, Any]):
         """
@@ -441,23 +470,32 @@ class Worker(WorkerUtils):
             routing_key=self.rabbitmq_dlq
         )
 
-    async def _requeue_message(self, body: bytes, headers: dict[str, Any], retry_count: int):
+    async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float):
         """
-        重新将消息入队并增加重试次数
+        将任务发送到延迟队列，使用 TTL + Dead Letter Exchange 实现延迟
         """
-        new_headers = dict(headers)
-        new_headers["x-retry-count"] = retry_count
+        # 清除延迟时间，避免循环延迟
+        job.defer_until = None
         
-        # 计算延迟时间（指数退避）
-        delay_seconds = self.rabbitmq_settings.retry_backoff * (2 ** (retry_count - 1))
+        # 序列化任务
+        message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
         
-        # 延迟发送
-        await asyncio.sleep(delay_seconds)
+        # 使用 timedelta 对象作为 expiration（aio-pika 接受的类型）
+        expiration = timedelta(seconds=delay_seconds)
         
+        # 发送到延迟队列，设置 TTL
         await self.channel.default_exchange.publish(
-            Message(body=body, headers=new_headers),
-            routing_key=self.rabbitmq_queue
+            Message(
+                body=message_body,
+                headers={"x-retry-count": job.job_try - 1},
+                expiration=expiration  # 使用 timedelta 对象
+            ),
+            routing_key=self.delay_queue
         )
+        
+        logger.info(f"任务 {job.job_id} 已发送到延迟队列，将在 {delay_seconds:.1f} 秒后重新处理")
+
+
 
     async def _health_check_loop(self):
         """
@@ -658,6 +696,11 @@ class Worker(WorkerUtils):
             # 关闭钩子
             if self.on_shutdown:
                 logger.info("执行关闭钩子")
+                # 最终同步统计数据
+                self.ctx['jobs_complete'] = self.jobs_complete
+                self.ctx['jobs_failed'] = self.jobs_failed
+                self.ctx['jobs_retried'] = self.jobs_retried
+                self.ctx['jobs_ongoing'] = len(self.tasks)
                 await self.on_shutdown(self.ctx)
             
             # 关闭连接

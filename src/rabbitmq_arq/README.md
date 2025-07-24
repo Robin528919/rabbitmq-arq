@@ -14,6 +14,7 @@
 - ⚡ **高性能**：支持高并发处理（prefetch_count 可配置）
 - 🎯 **Burst 模式**：类似 arq 的 burst 参数，处理完队列后自动退出
 - 🖥️ **命令行工具**：提供 CLI 工具支持，便于集成到 CI/CD
+- ⏰ **企业级延迟队列**：基于 RabbitMQ TTL + DLX，非阻塞高性能延迟任务
 
 ## 安装
 
@@ -158,10 +159,10 @@ async def unreliable_task(ctx: JobContext, url: str):
     try:
         result = await fetch_data(url)
     except NetworkError:
-        # 网络错误，稍后重试
+        # 网络错误，30秒后重试（使用 RabbitMQ TTL 延迟队列）
         raise Retry(defer=30)
     except InvalidDataError:
-        # 数据错误，使用指数退避重试
+        # 数据错误，使用指数退避重试（非阻塞延迟）
         raise Retry(defer=ctx.job_try * 10)
     except FatalError:
         # 致命错误，不再重试
@@ -169,6 +170,40 @@ async def unreliable_task(ctx: JobContext, url: str):
     
     return result
 ```
+
+### 延迟任务（企业级实现）
+
+RabbitMQ-ARQ 使用 **RabbitMQ TTL + Dead Letter Exchange** 实现真正的非阻塞延迟队列：
+
+```python
+# 延迟任务示例
+async def send_reminder_email(ctx: JobContext, user_id: int):
+    """发送提醒邮件"""
+    await send_email(user_id, "请完成您的操作")
+
+# 提交延迟任务
+job = await client.enqueue_job(
+    "send_reminder_email",
+    user_id=123,
+    _defer_by=3600  # 1小时后执行，Worker 不会阻塞
+)
+
+# 延迟到具体时间
+from datetime import datetime, timedelta
+future_time = datetime.now() + timedelta(hours=24)
+job = await client.enqueue_job(
+    "daily_report",
+    _defer_until=future_time  # 24小时后执行
+)
+```
+
+#### 延迟队列优势
+
+- ✅ **非阻塞**：Worker 立即处理下一个任务
+- ✅ **高并发**：支持数千个并发延迟任务  
+- ✅ **可靠持久**：延迟状态存储在 RabbitMQ 中
+- ✅ **分布式**：多个 Worker 节点无影响
+- ✅ **原生支持**：基于 RabbitMQ 成熟功能
 
 ## 配置选项
 

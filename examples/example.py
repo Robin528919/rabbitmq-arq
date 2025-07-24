@@ -280,20 +280,20 @@ async def main():
         )
         logger.info(f"✅ 已提交延迟邮件任务: {job3.job_id} (30秒后执行)")
         
-        # 批量提交任务
-        jobs = await client.enqueue_jobs([
-            {
-                "function": "process_user_data",
-                "args": [789, "batch_action"],
-                "kwargs": {"batch": True}
-            },
-            {
-                "function": "send_email",
-                "args": ["admin@example.com", "批量任务通知", "已提交批量任务"],
-                "_defer_by": 10
-            }
-        ])
-        logger.info(f"✅ 已批量提交 {len(jobs)} 个任务")
+        # # 批量提交任务
+        # jobs = await client.enqueue_jobs([
+        #     {
+        #         "function": "process_user_data",
+        #         "args": [789, "batch_action"],
+        #         "kwargs": {"batch": True}
+        #     },
+        #     {
+        #         "function": "send_email",
+        #         "args": ["admin@example.com", "批量任务通知", "已提交批量任务"],
+        #         "_defer_by": 10
+        #     }
+        # ])
+        # logger.info(f"✅ 已批量提交 {len(jobs)} 个任务")
         
         logger.info("🎉 所有任务提交完成！")
         
