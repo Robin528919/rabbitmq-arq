@@ -64,17 +64,34 @@ class WorkerUtils:
         收到信号后 worker 将停止获取新任务。
         """
         sig = Signals(signum)
-        logger.info('正在优雅关闭，设置 allow_pick_jobs 为 False')
-        self.allow_pick_jobs = False
-        logger.info(
-            '收到信号 %s ◆ %d 个任务完成 ◆ %d 个失败 ◆ %d 个重试 ◆ %d 个待完成',
-            sig.name,
-            self.jobs_complete,
-            self.jobs_failed,
-            self.jobs_retried,
-            len(self.tasks),
-        )
-        self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+        
+        if self._burst_mode:
+            logger.info(f'🛑 Burst 模式收到信号 {sig.name}，立即停止')
+            self.allow_pick_jobs = False
+            self._burst_should_exit = True
+            # 在 burst 模式下，可以选择立即退出或等待任务完成
+            if self.rabbitmq_settings.burst_wait_for_tasks:
+                logger.info(f'⏳ 等待 {len(self.tasks)} 个正在执行的任务完成...')
+                self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+            else:
+                logger.info('🚫 不等待任务完成，立即退出')
+                # 取消所有任务
+                for t in self.tasks.values():
+                    if not t.done():
+                        t.cancel()
+                self.main_task and self.main_task.cancel()
+        else:
+            logger.info('正在优雅关闭，设置 allow_pick_jobs 为 False')
+            self.allow_pick_jobs = False
+            logger.info(
+                '收到信号 %s ◆ %d 个任务完成 ◆ %d 个失败 ◆ %d 个重试 ◆ %d 个待完成',
+                sig.name,
+                self.jobs_complete,
+                self.jobs_failed,
+                self.jobs_retried,
+                len(self.tasks),
+            )
+            self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
 
     async def _wait_for_tasks_to_complete(self, signum: Signals) -> None:
         """
@@ -176,6 +193,12 @@ class Worker(WorkerUtils):
         
         # 健康检查任务
         self._health_check_task: asyncio.Task | None = None
+        
+        # Burst 模式相关属性
+        self._burst_mode = self.rabbitmq_settings.burst_mode
+        self._burst_start_time: datetime | None = None
+        self._burst_check_task: asyncio.Task | None = None
+        self._burst_should_exit = False
 
     async def _init(self):
         """
@@ -451,15 +474,115 @@ class Worker(WorkerUtils):
             except Exception as e:
                 logger.error(f"健康检查失败: {e}")
 
+    async def _get_queue_message_count(self) -> int:
+        """
+        获取队列中的消息数量
+        
+        Returns:
+            队列中待处理的消息数量
+        """
+        try:
+            queue = await self.channel.declare_queue(self.rabbitmq_queue, durable=True, passive=True)
+            return queue.declaration_result.message_count
+        except Exception as e:
+            logger.warning(f"获取队列消息数量失败: {e}")
+            return 0
+
+    async def _should_exit_burst_mode(self) -> bool:
+        """
+        检查是否应该退出 burst 模式
+        
+        Returns:
+            True 如果应该退出 burst 模式
+        """
+        if not self._burst_mode:
+            return False
+        
+        # 检查是否已标记为应该退出
+        if self._burst_should_exit:
+            return True
+        
+        # 检查超时
+        if self._burst_start_time:
+            elapsed = (datetime.now() - self._burst_start_time).total_seconds()
+            if elapsed >= self.rabbitmq_settings.burst_timeout:
+                logger.info(f"🕐 Burst 模式超时 ({elapsed:.1f}s >= {self.rabbitmq_settings.burst_timeout}s)，准备退出")
+                return True
+        
+        # 检查队列是否为空且没有正在执行的任务
+        queue_count = await self._get_queue_message_count()
+        running_tasks = len(self.tasks)
+        
+        if queue_count == 0 and running_tasks == 0:
+            logger.info("🎯 Burst 模式: 队列为空且没有正在执行的任务，准备退出")
+            return True
+        
+        # 如果配置了不等待任务完成，只检查队列是否为空
+        if not self.rabbitmq_settings.burst_wait_for_tasks and queue_count == 0:
+            logger.info("🎯 Burst 模式: 队列为空，立即退出（不等待正在执行的任务）")
+            return True
+            
+        logger.debug(f"Burst 检查: 队列={queue_count}条消息, 运行中={running_tasks}个任务")
+        return False
+
+    async def _burst_monitor_loop(self):
+        """
+        Burst 模式监控循环
+        """
+        if not self._burst_mode:
+            return
+            
+        logger.info(f"🚀 启动 Burst 模式监控 (超时: {self.rabbitmq_settings.burst_timeout}s)")
+        self._burst_start_time = datetime.now()
+        
+        while self.allow_pick_jobs and not self._burst_should_exit:
+            try:
+                if await self._should_exit_burst_mode():
+                    logger.info("📤 Burst 模式退出条件满足，停止接收新任务")
+                    self.allow_pick_jobs = False
+                    self._burst_should_exit = True
+                    
+                    # 如果需要等待任务完成
+                    if self.rabbitmq_settings.burst_wait_for_tasks and self.tasks:
+                        logger.info(f"⏳ 等待 {len(self.tasks)} 个正在执行的任务完成...")
+                        await self._sleep_until_tasks_complete()
+                    
+                    # 取消主任务以触发退出
+                    if self.main_task:
+                        self.main_task.cancel()
+                    break
+                
+                await asyncio.sleep(self.rabbitmq_settings.burst_check_interval)
+                
+            except asyncio.CancelledError:
+                logger.debug("Burst 监控循环被取消")
+                break
+            except Exception as e:
+                logger.error(f"Burst 监控出错: {e}")
+                await asyncio.sleep(1)
+
     async def consume(self):
         """
         开始消费消息
         """
-        logger.info(f"[*] 等待队列 {self.rabbitmq_queue} 中的消息。按 CTRL+C 退出")
+        if self._burst_mode:
+            # Burst 模式：检查队列是否为空
+            initial_queue_count = await self._get_queue_message_count()
+            if initial_queue_count == 0:
+                logger.info("🎯 Burst 模式: 队列为空，立即退出")
+                return
+            
+            logger.info(f"🚀 Burst 模式启动: 队列中有 {initial_queue_count} 条消息待处理")
+            # 启动 burst 监控
+            self._burst_check_task = asyncio.create_task(self._burst_monitor_loop())
+        else:
+            logger.info(f"[*] 等待队列 {self.rabbitmq_queue} 中的消息。按 CTRL+C 退出")
+        
         queue = await self.channel.declare_queue(self.rabbitmq_queue, durable=True)
         
-        # 开始健康检查
-        self._health_check_task = asyncio.create_task(self._health_check_loop())
+        # 开始健康检查（非 burst 模式或需要健康检查的 burst 模式）
+        if not self._burst_mode or self.rabbitmq_settings.health_check_interval > 0:
+            self._health_check_task = asyncio.create_task(self._health_check_loop())
         
         # 开始消费消息
         await queue.consume(lambda message: asyncio.create_task(self.on_message(message)))
@@ -467,16 +590,30 @@ class Worker(WorkerUtils):
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
-            logger.info("消费者被取消")
+            if self._burst_mode:
+                logger.info("🏁 Burst 模式消费者退出")
+            else:
+                logger.info("消费者被取消")
         finally:
+            # 清理任务
             if self._health_check_task:
                 self._health_check_task.cancel()
+            if self._burst_check_task:
+                self._burst_check_task.cancel()
 
     async def main(self):
         """
         Worker 主函数
         """
+        start_time = datetime.now()
+        
         try:
+            # Burst 模式启动信息
+            if self._burst_mode:
+                logger.info(f"🚀 启动 Burst 模式 Worker (超时: {self.rabbitmq_settings.burst_timeout}s)")
+            else:
+                logger.info("🚀 启动常规模式 Worker")
+            
             # 启动钩子
             if self.on_startup:
                 logger.info("执行启动钩子")
@@ -493,10 +630,31 @@ class Worker(WorkerUtils):
             
         except KeyboardInterrupt:
             logger.info("收到键盘中断信号")
+        except asyncio.CancelledError:
+            if self._burst_mode:
+                # 计算运行时间和统计信息
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logger.info(f"🏁 Burst 模式正常结束 (运行时间: {elapsed:.1f}s)")
+                logger.info(f"📊 任务统计: 完成 {self.jobs_complete} 个, "
+                          f"失败 {self.jobs_failed} 个, "
+                          f"重试 {self.jobs_retried} 个")
+            else:
+                logger.info("Worker 被取消")
         except Exception as e:
             logger.error(f"Worker 运行出错: {e}\n{traceback.format_exc()}")
             raise
         finally:
+            # 等待最后的任务完成（如果在 burst 模式且配置了等待）
+            if self._burst_mode and self.rabbitmq_settings.burst_wait_for_tasks and self.tasks:
+                logger.info(f"⏳ 等待最后 {len(self.tasks)} 个任务完成...")
+                try:
+                    await asyncio.wait_for(
+                        self._sleep_until_tasks_complete(),
+                        timeout=30  # 最多等待30秒
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("等待任务完成超时，强制退出")
+            
             # 关闭钩子
             if self.on_shutdown:
                 logger.info("执行关闭钩子")

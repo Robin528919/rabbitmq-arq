@@ -12,6 +12,8 @@
 - 🔌 **生命周期钩子**：startup/shutdown/job_start/job_end 钩子
 - 🌐 **中文日志**：完整的中文日志支持
 - ⚡ **高性能**：支持高并发处理（prefetch_count 可配置）
+- 🎯 **Burst 模式**：类似 arq 的 burst 参数，处理完队列后自动退出
+- 🖥️ **命令行工具**：提供 CLI 工具支持，便于集成到 CI/CD
 
 ## 安装
 
@@ -185,12 +187,59 @@ settings = RabbitMQSettings(
     job_timeout=300,            # 任务超时时间（秒）
     prefetch_count=100,         # 预取消息数量
     
+    # Burst 模式配置
+    burst_mode=False,           # 是否启用 burst 模式
+    burst_timeout=300,          # burst 模式最大运行时间（秒）
+    burst_check_interval=1.0,   # 队列状态检查间隔（秒）
+    burst_wait_for_tasks=True,  # 退出前是否等待正在执行的任务完成
+    
     # 其他配置
     enable_compression=False,   # 是否启用消息压缩
     health_check_interval=60,   # 健康检查间隔（秒）
     log_level="INFO"           # 日志级别
 )
 ```
+
+## Burst 模式
+
+Burst 模式类似于 [arq](https://github.com/samuelcolvin/arq) 的 burst 参数，适用于批处理和定时任务场景。
+
+### 特点
+
+- 🎯 **自动退出**：处理完队列中的所有任务后自动退出
+- ⏱️ **超时保护**：设置最大运行时间，防止无限期运行
+- 🔄 **智能监控**：定期检查队列状态，动态决定是否退出
+- ⚙️ **灵活配置**：可选择是否等待正在执行的任务完成
+
+### 使用示例
+
+```python
+# Burst 模式配置
+burst_settings = RabbitMQSettings(
+    rabbitmq_url="amqp://guest:guest@localhost:5672/",
+    rabbitmq_queue="batch_queue",
+    burst_mode=True,            # 启用 burst 模式
+    burst_timeout=600,          # 最多运行 10 分钟
+    burst_check_interval=2.0,   # 每 2 秒检查一次队列状态
+    burst_wait_for_tasks=True   # 退出前等待任务完成
+)
+
+# Worker 配置
+class BurstWorkerSettings:
+    functions = [process_batch_data]
+    rabbitmq_settings = burst_settings
+
+# 运行 Worker（处理完所有任务后自动退出）
+Worker.run(BurstWorkerSettings)
+```
+
+### 适用场景
+
+- **定时批处理**：每小时/每天处理积累的数据
+- **数据迁移**：一次性处理大量数据迁移任务
+- **CI/CD 流水线**：在部署流程中处理特定任务
+- **报告生成**：定期生成和发送报告
+- **清理任务**：定期清理临时文件和过期数据
 
 ## 与现有项目集成
 
@@ -254,12 +303,54 @@ Worker 会定期输出统计信息：
 
 Worker 定期进行健康检查，可以集成到 K8s 或其他监控系统。
 
+## 命令行工具
+
+RabbitMQ-ARQ 提供了便捷的命令行工具：
+
+### 安装后可用命令
+
+```bash
+# 启动常规模式 Worker
+rabbitmq-arq worker -m myapp.workers:WorkerSettings
+
+# 启动 Burst 模式 Worker
+rabbitmq-arq worker -m myapp.workers:WorkerSettings --burst
+
+# 使用自定义配置
+rabbitmq-arq worker -m myapp.workers:WorkerSettings \
+    --rabbitmq-url amqp://user:pass@localhost:5672/ \
+    --queue my_queue \
+    --burst \
+    --burst-timeout 600
+
+# 查看队列信息
+rabbitmq-arq queue-info --queue my_queue
+
+# 清空队列
+rabbitmq-arq purge-queue --queue my_queue
+
+# 查看所有可用选项
+rabbitmq-arq worker --help
+```
+
+### 命令行参数
+
+- `--burst, -b`: 启用 Burst 模式
+- `--burst-timeout`: Burst 模式超时时间
+- `--burst-check-interval`: 队列检查间隔
+- `--no-wait-tasks`: 不等待正在执行的任务完成
+- `--rabbitmq-url, -u`: RabbitMQ 连接 URL
+- `--queue, -q`: 队列名称
+- `--prefetch-count, -p`: 预取消息数量
+- `--log-level, -l`: 日志级别
+
 ## 注意事项
 
 1. **任务函数第一个参数必须是 `ctx: JobContext`**
 2. **任务函数必须是可序列化的（不要使用 lambda 或闭包）**
 3. **确保 RabbitMQ 服务正常运行**
 4. **根据实际负载调整 `prefetch_count`**
+5. **Burst 模式适用于批处理场景，常规业务建议使用标准模式**
 
 ## License
 
