@@ -256,13 +256,18 @@ class Worker(WorkerUtils):
                     await message.reject(requeue=True)
                     return
                 
-                # 检查延迟执行时间
-                if job.defer_until and job.defer_until > datetime.now():
+                # 检查是否是客户端已处理的延迟任务
+                client_delayed = headers.get("x-client-delayed") == "true"
+                
+                # 只有非客户端延迟任务才需要检查延迟执行时间
+                if not client_delayed and job.defer_until and job.defer_until > datetime.now():
                     delay_seconds = (job.defer_until - datetime.now()).total_seconds()
                     logger.info(f"任务 {job_id} 需要延迟 {delay_seconds:.1f} 秒执行，发送到延迟队列")
                     # 发送到延迟队列，不阻塞当前处理
                     await self._send_to_delay_queue(job, delay_seconds)
                     return
+                elif client_delayed:
+                    logger.debug(f"任务 {job_id} 已由客户端处理延迟，直接执行")
                 
                 # 创建任务并执行
                 task = asyncio.create_task(self._execute_job(job))
