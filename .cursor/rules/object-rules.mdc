@@ -6,3 +6,4 @@ alwaysApply: true
 2、使用最新的 Pydantic V2 进行数据验证
 3、完全基于 asyncio
 4、代码注释使用中文语言
+5、使用conda 虚拟环境、环境名称 rabbitmq_arq
