@@ -29,6 +29,8 @@ class RabbitMQClient:
     
     支持单个和批量任务提交，延迟执行，以及任务生命周期管理。
     使用 Python 3.12 现代类型注解。
+    
+    每个队列支持独立的延迟机制检测和配置。
     """
     
     def __init__(self, rabbitmq_settings: RabbitMQSettings | None = None) -> None:
@@ -42,34 +44,52 @@ class RabbitMQClient:
         self.connection: RobustConnection | None = None
         self.channel = None
         
-        # 延迟机制检测标志（每个队列可能不同）
-        self._delay_mechanisms: dict[str, dict] = {}  # 按队列存储延迟机制信息
-        self._delay_mechanism_detected = False
+        # 按队列存储延迟机制信息和队列状态
+        self._delay_mechanisms: dict[str, dict] = {}
+        self._declared_queues: set[str] = set()  # 已声明的队列缓存
         
     async def connect(self):
         """
-        连接到 RabbitMQ 并检测延迟机制
+        连接到 RabbitMQ（不进行队列操作）
         """
         if not self.connection or self.connection.is_closed:
+            logger.info("🔗 正在连接到 RabbitMQ...")
             self.connection = await connect_robust(self.rabbitmq_settings.rabbitmq_url)
             self.channel = await self.connection.channel()
-            
-            # 声明主队列
-            await self.channel.declare_queue(self.rabbitmq_settings.rabbitmq_queue, durable=True)
-            
-            # 检测延迟机制（只检测一次）
-            if not self._delay_mechanism_detected:
-                await self._detect_delay_mechanism()
-                self._delay_mechanism_detected = True
+            logger.info("✅ 成功连接到 RabbitMQ")
     
-    async def _detect_delay_mechanism(self):
+    async def _ensure_queue(self, queue_name: str) -> None:
         """
-        检测并设置延迟机制：优先使用延迟插件，其次使用 TTL + DLX
+        确保队列已声明（带缓存）
+        
+        Args:
+            queue_name: 队列名称
         """
+        if queue_name not in self._declared_queues:
+            await self.channel.declare_queue(queue_name, durable=True)
+            self._declared_queues.add(queue_name)
+            logger.debug(f"📦 队列已声明: {queue_name}")
+    
+    async def _detect_delay_mechanism_for_queue(self, queue_name: str) -> None:
+        """
+        为指定队列检测并设置延迟机制：优先使用延迟插件，其次使用 TTL + DLX
+        
+        Args:
+            queue_name: 队列名称
+        """
+        if queue_name in self._delay_mechanisms:
+            return  # 已检测过
+            
+        logger.info(f"🔍 正在为队列 {queue_name} 检测延迟机制...")
+        
+        # 定义延迟相关的名称
+        delayed_exchange_name = f"delayed.{queue_name}"
+        delay_queue_name = f"delay.{queue_name}"
+        
         try:
             # 尝试声明延迟交换机（需要 rabbitmq_delayed_message_exchange 插件）
             delayed_exchange = await self.channel.declare_exchange(
-                self._delayed_exchange_name,
+                delayed_exchange_name,
                 type='x-delayed-message',  # 特殊的延迟消息类型
                 durable=True,
                 arguments={
@@ -77,29 +97,45 @@ class RabbitMQClient:
                 }
             )
             
-            # 绑定延迟交换机到主队列
-            queue = await self.channel.get_queue(self.rabbitmq_settings.rabbitmq_queue)
-            await queue.bind(delayed_exchange, routing_key=self.rabbitmq_settings.rabbitmq_queue)
+            # 确保目标队列存在并绑定延迟交换机
+            await self._ensure_queue(queue_name)
+            queue = await self.channel.get_queue(queue_name)
+            await queue.bind(delayed_exchange, routing_key=queue_name)
             
-            self._use_delayed_exchange = True
-            logger.info("✅ 客户端检测到 RabbitMQ 延迟插件，使用延迟交换机模式")
+            # 记录成功使用延迟插件
+            self._delay_mechanisms[queue_name] = {
+                "use_delayed_exchange": True,
+                "delayed_exchange_name": delayed_exchange_name,
+                "delay_queue_name": delay_queue_name,
+                "detected": True
+            }
+            logger.info(f"✅ 队列 {queue_name} 检测到 RabbitMQ 延迟插件，使用延迟交换机模式")
             
         except Exception as e:
             # 插件未安装或声明失败，降级到 TTL + DLX 方案
-            logger.warning(f"⚠️ 客户端未检测到 RabbitMQ 延迟插件: {e}")
-            logger.info("📌 客户端降级使用 TTL + Dead Letter Exchange 方案")
+            logger.warning(f"⚠️ 队列 {queue_name} 未检测到 RabbitMQ 延迟插件: {e}")
+            logger.info(f"📌 队列 {queue_name} 降级使用 TTL + Dead Letter Exchange 方案")
+            
+            # 确保目标队列存在
+            await self._ensure_queue(queue_name)
             
             # 声明 TTL 延迟队列
             await self.channel.declare_queue(
-                self._delay_queue_name,
+                delay_queue_name,
                 durable=True,
                 arguments={
                     'x-dead-letter-exchange': '',  # 默认交换机
-                    'x-dead-letter-routing-key': self.rabbitmq_settings.rabbitmq_queue  # 路由到主队列
+                    'x-dead-letter-routing-key': queue_name  # 路由到主队列
                 }
             )
             
-            self._use_delayed_exchange = False
+            # 记录使用 TTL + DLX 方案
+            self._delay_mechanisms[queue_name] = {
+                "use_delayed_exchange": False,
+                "delayed_exchange_name": delayed_exchange_name,
+                "delay_queue_name": delay_queue_name,
+                "detected": True
+            }
     
     async def close(self):
         """
@@ -107,6 +143,7 @@ class RabbitMQClient:
         """
         if self.connection and not self.connection.is_closed:
             await self.connection.close()
+            logger.info("🔌 RabbitMQ 连接已关闭")
     
     async def enqueue_job(
         self,
@@ -139,6 +176,13 @@ class RabbitMQClient:
         """
         # 确保连接
         await self.connect()
+        
+        # 确保队列存在
+        await self._ensure_queue(queue_name)
+        
+        # 按需检测延迟机制
+        if queue_name not in self._delay_mechanisms:
+            await self._detect_delay_mechanism_for_queue(queue_name)
         
         # 生成任务 ID
         job_id = _job_id or uuid.uuid4().hex
@@ -208,32 +252,44 @@ class RabbitMQClient:
                 ),
                 routing_key=queue_name
             )
+            logger.info(f"📤 任务已提交: {job.job_id} -> {queue_name}")
         
         return job
     
     async def _send_delayed_job(self, message_body: bytes, queue_name: str, delay_seconds: float, headers: dict | None = None):
         """
         发送延迟任务，自动选择最佳延迟机制
+        
+        Args:
+            message_body: 消息体
+            queue_name: 目标队列名
+            delay_seconds: 延迟秒数
+            headers: 消息头
         """
         if headers is None:
             headers = {"x-retry-count": 0}
         
-        if self._use_delayed_exchange:
+        # 获取队列的延迟机制配置
+        delay_config = self._delay_mechanisms.get(queue_name, {})
+        use_delayed_exchange = delay_config.get("use_delayed_exchange", False)
+        
+        if use_delayed_exchange:
             # 使用延迟插件（最优方案）
             delay_ms = int(delay_seconds * 1000)
             headers['x-delay'] = delay_ms
             
-            # 获取延迟交换机并发送
-            delayed_exchange = await self.channel.get_exchange(self._delayed_exchange_name)
+            delayed_exchange_name = delay_config["delayed_exchange_name"]
+            delayed_exchange = await self.channel.get_exchange(delayed_exchange_name)
             await delayed_exchange.publish(
                 Message(body=message_body, headers=headers),
                 routing_key=queue_name
             )
-            logger.debug(f"🚀 使用延迟交换机发送任务 (延迟 {delay_seconds:.1f} 秒)")
+            logger.debug(f"🚀 使用延迟交换机发送任务到 {queue_name} (延迟 {delay_seconds:.1f} 秒)")
             
         else:
             # 使用 TTL + DLX 方案（降级方案）
             expiration = timedelta(seconds=delay_seconds)
+            delay_queue_name = delay_config["delay_queue_name"]
             
             # 发送到 TTL 延迟队列
             await self.channel.default_exchange.publish(
@@ -242,9 +298,9 @@ class RabbitMQClient:
                     headers=headers,
                     expiration=expiration
                 ),
-                routing_key=self._delay_queue_name
+                routing_key=delay_queue_name
             )
-            logger.debug(f"⏱️ 使用 TTL 队列发送任务 (延迟 {delay_seconds:.1f} 秒)")
+            logger.debug(f"⏱️ 使用 TTL 队列发送任务到 {queue_name} (延迟 {delay_seconds:.1f} 秒)")
     
     async def enqueue_jobs(
         self,
@@ -258,7 +314,8 @@ class RabbitMQClient:
                 - function: 函数名
                 - args: 位置参数列表
                 - kwargs: 关键字参数字典
-                - 其他可选参数（_job_id, _queue_name 等）
+                - queue_name: 目标队列名（必需）
+                - 其他可选参数（_job_id, _defer_until 等）
                 
         Returns:
             List[JobModel]: 任务对象列表
@@ -266,6 +323,7 @@ class RabbitMQClient:
         results = []
         for job_spec in jobs:
             function = job_spec.pop('function')
+            queue_name = job_spec.pop('queue_name')  # 现在是必需的
             args = job_spec.pop('args', [])
             kwargs = job_spec.pop('kwargs', {})
             
@@ -279,7 +337,13 @@ class RabbitMQClient:
             kwargs.update(job_spec)
             
             # 提交任务
-            job = await self.enqueue_job(function, *args, **special_params, **kwargs)
+            job = await self.enqueue_job(
+                function, 
+                *args, 
+                queue_name=queue_name,
+                **special_params, 
+                **kwargs
+            )
             results.append(job)
         
         return results
