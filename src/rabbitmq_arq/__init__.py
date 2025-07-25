@@ -5,7 +5,7 @@
 # @IDE            : PyCharm
 # @desc           : RabbitMQ-ARQ - 基于 RabbitMQ 的异步任务队列库
 
-from .worker import Worker
+from .worker import Worker, WorkerSettings
 from .client import RabbitMQClient, create_client
 from .connections import RabbitMQSettings
 from .exceptions import (
@@ -30,6 +30,7 @@ __version__ = "0.1.0"
 __all__ = [
     # Worker
     "Worker",
+    "WorkerSettings",
     
     # Client
     "RabbitMQClient",

@@ -15,11 +15,12 @@
 - 🎯 **Burst 模式**：类似 arq 的 burst 参数，处理完队列后自动退出
 - 🖥️ **命令行工具**：提供 CLI 工具支持，便于集成到 CI/CD
 - ⏰ **企业级延迟队列**：基于 RabbitMQ TTL + DLX，非阻塞高性能延迟任务
+- 🔧 **配置分离**：连接配置与业务配置分离，更好的可维护性
 
 ## 安装
 
 ```bash
-pip install aio-pika pydantic
+pip install aio-pika pydantic click
 ```
 
 ## 快速开始
@@ -43,61 +44,85 @@ async def process_data(ctx: JobContext, data_id: int, action: str):
     return {"status": "success", "data_id": data_id}
 ```
 
-### 2. 配置和运行 Worker
+### 2. 配置 Worker
 
 ```python
-from rabbitmq_arq import Worker, RabbitMQSettings
+from rabbitmq_arq import Worker, WorkerSettings, RabbitMQSettings
 
-# 配置
-settings = RabbitMQSettings(
+# RabbitMQ 连接配置
+rabbitmq_settings = RabbitMQSettings(
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="my_queue",
-    max_retries=3,
-    prefetch_count=100
+    prefetch_count=100,
+    connection_timeout=30
 )
 
 # Worker 配置
-class WorkerSettings:
-    functions = [process_data]  # 注册任务函数
-    rabbitmq_settings = settings
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data],
+    worker_name="my_worker",
+    
+    # 队列配置
+    queue_name="my_queue",
+    dlq_name="my_queue_dlq",
+    
+    # 任务处理配置
+    max_retries=3,
+    retry_backoff=5.0,
+    job_timeout=300,
+    max_concurrent_jobs=10,
+    
+    # 日志配置
+    log_level="INFO"
+)
 
 # 运行 Worker
-Worker.run(WorkerSettings)
+if __name__ == "__main__":
+    worker = Worker(worker_settings)
+    import asyncio
+    asyncio.run(worker.main())
 ```
 
 ### 3. 提交任务
 
 ```python
-import asyncio
 from rabbitmq_arq import RabbitMQClient, RabbitMQSettings
+import asyncio
 
-async def main():
-    # 创建客户端
-    settings = RabbitMQSettings(
-        rabbitmq_url="amqp://guest:guest@localhost:5672/",
-        rabbitmq_queue="my_queue"
+async def submit_tasks():
+    # 创建客户端（只需要连接配置）
+    rabbitmq_settings = RabbitMQSettings(
+        rabbitmq_url="amqp://guest:guest@localhost:5672/"
     )
-    client = RabbitMQClient(settings)
+    client = RabbitMQClient(rabbitmq_settings)
     
-    # 提交任务
-    job = await client.enqueue_job(
-        "process_data",  # 函数名
-        123,            # data_id
-        "update"        # action
-    )
-    print(f"任务已提交: {job.job_id}")
-    
-    # 提交延迟任务
-    job = await client.enqueue_job(
-        "process_data",
-        456,
-        "delayed",
-        _defer_by=60  # 60秒后执行
-    )
-    
-    await client.close()
+    try:
+        await client.connect()
+        
+        # 提交任务
+        job = await client.enqueue_job(
+            "process_data",
+            data_id=123,
+            action="process",
+            queue_name="my_queue"  # 指定队列名
+        )
+        print(f"任务已提交: {job.job_id}")
+        
+        # 提交延迟任务
+        delayed_job = await client.enqueue_job(
+            "process_data",
+            data_id=456,
+            action="cleanup",
+            queue_name="my_queue",
+            _defer_by=60  # 60秒后执行
+        )
+        print(f"延迟任务已提交: {delayed_job.job_id}")
+        
+    finally:
+        await client.close()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(submit_tasks())
 ```
 
 ## 高级功能
@@ -109,11 +134,13 @@ async def startup(ctx: dict):
     """Worker 启动时执行"""
     # 初始化数据库连接、HTTP 客户端等
     ctx['db'] = await create_db_connection()
+    ctx['http_client'] = aiohttp.ClientSession()
 
 async def shutdown(ctx: dict):
     """Worker 关闭时执行"""
     # 清理资源
     await ctx['db'].close()
+    await ctx['http_client'].close()
 
 async def on_job_start(ctx: dict):
     """每个任务开始前执行"""
@@ -123,13 +150,23 @@ async def on_job_end(ctx: dict):
     """每个任务结束后执行"""
     print(f"任务 {ctx['job_id']} 执行结束")
 
-class WorkerSettings:
-    functions = [process_data]
-    rabbitmq_settings = settings
-    on_startup = startup
-    on_shutdown = shutdown
-    on_job_start = on_job_start
-    on_job_end = on_job_end
+# Worker 配置（使用新的配置结构）
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data],
+    worker_name="my_worker",
+    
+    # 队列配置
+    queue_name="my_queue",
+    
+    # 生命周期钩子
+    on_startup=startup,
+    on_shutdown=shutdown,
+    on_job_start=on_job_start,
+    on_job_end=on_job_end,
+    
+    # 其他配置...
+)
 ```
 
 ### 批量提交任务
@@ -210,31 +247,84 @@ job = await client.enqueue_job(
 
 ## 配置选项
 
+### RabbitMQ 连接配置
+
 ```python
-settings = RabbitMQSettings(
-    # 基础配置
+from rabbitmq_arq import RabbitMQSettings
+
+# 连接配置（仅连接相关）
+rabbitmq_settings = RabbitMQSettings(
+    # 基础连接配置
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="my_queue",
-    rabbitmq_dlq="my_queue_dlq",
+    connection_timeout=30,          # 连接超时时间（秒）
+    heartbeat=60,                   # 心跳间隔（秒）
     
-    # 重试配置
-    max_retries=3,              # 最大重试次数
-    retry_backoff=5.0,          # 重试退避时间（秒）
+    # 连接池配置
+    connection_pool_size=10,        # 连接池大小
+    channel_pool_size=100,          # 通道池大小
     
     # 性能配置
-    job_timeout=300,            # 任务超时时间（秒）
-    prefetch_count=100,         # 预取消息数量
+    prefetch_count=100,             # 预取消息数量
+    enable_compression=False,       # 是否启用消息压缩
     
-    # Burst 模式配置
-    burst_mode=False,           # 是否启用 burst 模式
-    burst_timeout=300,          # burst 模式最大运行时间（秒）
-    burst_check_interval=1.0,   # 队列状态检查间隔（秒）
-    burst_wait_for_tasks=True,  # 退出前是否等待正在执行的任务完成
+    # 安全配置
+    ssl_enabled=False,              # 是否启用SSL
+    ssl_cert_path=None,             # SSL证书路径
+    ssl_key_path=None,              # SSL私钥路径
     
-    # 其他配置
-    enable_compression=False,   # 是否启用消息压缩
-    health_check_interval=60,   # 健康检查间隔（秒）
-    log_level="INFO"           # 日志级别
+    # 重连配置
+    auto_reconnect=True,            # 是否自动重连
+    reconnect_interval=5.0,         # 重连间隔（秒）
+    max_reconnect_attempts=10,      # 最大重连次数
+)
+```
+
+### Worker 配置
+
+```python
+from rabbitmq_arq import WorkerSettings
+
+# Worker 配置（业务逻辑配置）
+worker_settings = WorkerSettings(
+    # 基础配置
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data],
+    worker_name="my_worker",
+    
+    # 队列配置
+    queue_name="my_queue",
+    dlq_name="my_queue_dlq",
+    queue_durable=True,
+    queue_exclusive=False,
+    queue_auto_delete=False,
+    
+    # 任务处理配置
+    max_retries=3,                  # 最大重试次数
+    retry_backoff=5.0,              # 重试退避时间（秒）
+    job_timeout=300,                # 任务超时时间（秒）
+    max_concurrent_jobs=10,         # 最大并发任务数
+    
+    # 任务结果配置
+    enable_job_result_storage=True, # 是否存储任务结果
+    job_result_ttl=86400,           # 任务结果保存时间（秒）
+    
+    # Worker运行模式配置
+    health_check_interval=60,       # 健康检查间隔（秒）
+    job_completion_wait=5,          # 关闭时等待任务完成时间（秒）
+    graceful_shutdown_timeout=30,   # 优雅关闭总超时（秒）
+    
+    # 日志配置
+    log_level="INFO",               # 日志级别
+    log_format=None,                # 日志格式
+    log_file=None,                  # 日志文件路径
+    
+    # 延迟任务配置
+    enable_delayed_jobs=True,       # 启用延迟任务
+    delay_mechanism="auto",         # 延迟机制（auto/plugin/ttl）
+    
+    # 调试配置
+    debug_mode=False,               # 调试模式
+    trace_tasks=False,              # 追踪任务执行
 )
 ```
 
@@ -252,23 +342,28 @@ Burst 模式类似于 [arq](https://github.com/samuelcolvin/arq) 的 burst 参�
 ### 使用示例
 
 ```python
-# Burst 模式配置
-burst_settings = RabbitMQSettings(
-    rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="batch_queue",
-    burst_mode=True,            # 启用 burst 模式
-    burst_timeout=600,          # 最多运行 10 分钟
-    burst_check_interval=2.0,   # 每 2 秒检查一次队列状态
-    burst_wait_for_tasks=True   # 退出前等待任务完成
+# Burst 模式 Worker 配置
+burst_worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data],
+    worker_name="burst_worker",
+    
+    # 队列配置
+    queue_name="batch_queue",
+    
+    # Burst 模式配置
+    burst_mode=True,                # 启用 burst 模式
+    burst_timeout=600,              # 最多运行 10 分钟
+    burst_check_interval=2.0,       # 每 2 秒检查一次队列状态
+    burst_wait_for_tasks=True,      # 退出前等待任务完成
+    burst_exit_on_empty=True,       # 队列为空时是否退出
+    
+    # 其他配置...
 )
 
-# Worker 配置
-class BurstWorkerSettings:
-    functions = [process_batch_data]
-    rabbitmq_settings = burst_settings
-
-# 运行 Worker（处理完所有任务后自动退出）
-Worker.run(BurstWorkerSettings)
+# 运行 Burst Worker
+worker = Worker(burst_worker_settings)
+asyncio.run(worker.main())
 ```
 
 ### 适用场景
@@ -343,44 +438,101 @@ Worker 定期进行健康检查，可以集成到 K8s 或其他监控系统。
 
 ## 命令行工具
 
-RabbitMQ-ARQ 提供了便捷的命令行工具：
+RabbitMQ-ARQ 提供了便捷的命令行工具，支持分离的连接和业务配置：
 
 ### 安装后可用命令
 
 ```bash
 # 启动常规模式 Worker
-rabbitmq-arq worker -m myapp.workers:WorkerSettings
+rabbitmq-arq worker -m myapp.workers:worker_settings
 
 # 启动 Burst 模式 Worker
-rabbitmq-arq worker -m myapp.workers:WorkerSettings --burst
+rabbitmq-arq worker -m myapp.workers:worker_settings --burst
 
-# 使用自定义配置
-rabbitmq-arq worker -m myapp.workers:WorkerSettings \
+# 使用自定义连接和Worker配置
+rabbitmq-arq worker -m myapp.workers:worker_settings \
     --rabbitmq-url amqp://user:pass@localhost:5672/ \
+    --prefetch-count 50 \
+    --connection-timeout 60 \
     --queue my_queue \
+    --max-retries 5 \
+    --job-timeout 600 \
+    --max-concurrent-jobs 20 \
     --burst \
-    --burst-timeout 600
+    --burst-timeout 600 \
+    --burst-no-wait
 
 # 查看队列信息
-rabbitmq-arq queue-info --queue my_queue
+rabbitmq-arq queue-info --queue my_queue --rabbitmq-url amqp://localhost
 
 # 清空队列
-rabbitmq-arq purge-queue --queue my_queue
+rabbitmq-arq purge-queue --queue my_queue --rabbitmq-url amqp://localhost
+
+# 验证Worker配置
+rabbitmq-arq validate-config -m myapp.workers:worker_settings
 
 # 查看所有可用选项
 rabbitmq-arq worker --help
 ```
 
-### 命令行参数
+### 命令行参数详解
 
-- `--burst, -b`: 启用 Burst 模式
-- `--burst-timeout`: Burst 模式超时时间
-- `--burst-check-interval`: 队列检查间隔
-- `--no-wait-tasks`: 不等待正在执行的任务完成
+#### RabbitMQ 连接配置
 - `--rabbitmq-url, -u`: RabbitMQ 连接 URL
-- `--queue, -q`: 队列名称
-- `--prefetch-count, -p`: 预取消息数量
-- `--log-level, -l`: 日志级别
+- `--prefetch-count`: 预取消息数量（默认: 100）
+- `--connection-timeout`: 连接超时时间（默认: 30秒）
+
+#### Worker 配置
+- `--worker-module, -m`: Worker 模块路径（必需）
+- `--queue, -q`: 队列名称（默认: default）
+- `--max-retries, -r`: 最大重试次数（默认: 3）
+- `--job-timeout, -t`: 任务超时时间（默认: 300秒）
+- `--max-concurrent-jobs`: 最大并发任务数（默认: 10）
+
+#### Burst 模式配置
+- `--burst, -b`: 启用 Burst 模式
+- `--burst-timeout`: Burst 模式超时时间（默认: 300秒）
+- `--burst-check-interval`: 队列检查间隔（默认: 1.0秒）
+- `--burst-no-wait`: 不等待正在执行的任务完成
+
+#### 日志配置
+- `--log-level, -l`: 日志级别（DEBUG/INFO/WARNING/ERROR/CRITICAL）
+
+### Worker 模块配置文件示例
+
+创建 `myapp/workers.py`:
+
+```python
+from rabbitmq_arq import WorkerSettings, RabbitMQSettings
+
+# 连接配置
+rabbitmq_settings = RabbitMQSettings(
+    rabbitmq_url="amqp://guest:guest@localhost:5672/"
+)
+
+# Worker 配置
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data, send_email],  # 你的任务函数
+    worker_name="production_worker",
+    queue_name="default",
+    max_retries=3,
+    job_timeout=300,
+)
+
+# 或者，也可以直接导出函数列表
+task_functions = [process_data, send_email]
+```
+
+然后使用：
+
+```bash
+# 使用 WorkerSettings
+rabbitmq-arq worker -m myapp.workers:worker_settings
+
+# 或使用函数列表
+rabbitmq-arq worker -m myapp.workers:task_functions --queue my_queue
+```
 
 ## 注意事项
 

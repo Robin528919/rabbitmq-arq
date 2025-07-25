@@ -42,10 +42,8 @@ class RabbitMQClient:
         self.connection: RobustConnection | None = None
         self.channel = None
         
-        # 延迟机制检测标志
-        self._use_delayed_exchange = False
-        self._delayed_exchange_name = f"delayed.{self.rabbitmq_settings.rabbitmq_queue}"
-        self._delay_queue_name = f"{self.rabbitmq_settings.rabbitmq_queue}_delay"
+        # 延迟机制检测标志（每个队列可能不同）
+        self._delay_mechanisms: dict[str, dict] = {}  # 按队列存储延迟机制信息
         self._delay_mechanism_detected = False
         
     async def connect(self):
@@ -114,8 +112,8 @@ class RabbitMQClient:
         self,
         function: str,
         *args,
+        queue_name: str,  # 现在成为必需参数
         _job_id: str | None = None,
-        _queue_name: str | None = None,
         _defer_until: datetime | None = None,
         _defer_by: int | float | timedelta | None = None,
         _expires: int | float | timedelta | None = None,
@@ -128,8 +126,8 @@ class RabbitMQClient:
         Args:
             function: 要执行的函数名
             *args: 位置参数
+            queue_name: 队列名称（必需参数）
             _job_id: 任务 ID，如果不提供则自动生成
-            _queue_name: 队列名称，如果不提供则使用默认队列
             _defer_until: 延迟执行到指定时间
             _defer_by: 延迟执行的时间间隔
             _expires: 任务过期时间
@@ -144,9 +142,6 @@ class RabbitMQClient:
         
         # 生成任务 ID
         job_id = _job_id or uuid.uuid4().hex
-        
-        # 队列名称
-        queue_name = _queue_name or self.rabbitmq_settings.rabbitmq_queue
         
         # 计算延迟执行时间
         defer_until = None
