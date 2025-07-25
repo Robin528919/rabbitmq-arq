@@ -9,7 +9,7 @@ description = "一个基于RabbitMQ的任务队列库，提供类似arq的简洁
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "rabbitmq-arq", email = "rabbitmq-arq@example.com"}
+    {name = "RabbitMQ-ARQ Team", email = "robin528919@gmail.com"}
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -28,9 +28,6 @@ requires-python = ">=3.8"
 dependencies = [
     "aio-pika>=9.0.0",
     "pydantic>=2.0.0",
-    "asyncio-mqtt>=0.16.0",
-    "orjson>=3.9.0",
-    "structlog>=23.1.0",
     "click>=8.0.0",
 ]
 
