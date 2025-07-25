@@ -7,10 +7,10 @@
 
 from __future__ import annotations
 
-import uuid
 from typing import Sequence, Callable
 
 from .protocols import StartupShutdown, WorkerCoroutine
+from .constants import default_queue_name
 
 
 class RabbitMQSettings:
@@ -132,7 +132,7 @@ class WorkerSettings:
                  worker_name: str | None = None,
 
                  # === 队列配置 ===
-                 queue_name: str = "default",
+                 queue_name: str = default_queue_name,
                  dlq_name: str | None = None,
                  queue_durable: bool = True,
                  queue_exclusive: bool = False,
@@ -148,15 +148,15 @@ class WorkerSettings:
                  enable_job_result_storage: bool = True,
                  job_result_ttl: int = 86400,
 
-                 # === Worker运行模式配置 ===
-                 health_check_interval: int = 60,
-                 job_completion_wait: int = 5,
+                 # === Worker 运行时配置 ===
+                 health_check_interval: int = 30,
+                 job_completion_wait: int = 10,
                  graceful_shutdown_timeout: int = 30,
 
-                 # === Burst模式配置 ===
+                 # === Burst 模式配置 ===
                  burst_mode: bool = False,
                  burst_timeout: int = 300,
-                 burst_check_interval: float = 1.0,
+                 burst_check_interval: int = 5,
                  burst_wait_for_tasks: bool = True,
                  burst_exit_on_empty: bool = True,
 
@@ -167,7 +167,7 @@ class WorkerSettings:
 
                  # === 信号处理配置 ===
                  handle_signals: bool = True,
-                 signal_timeout: int = 10,
+                 signal_timeout: int = 30,
 
                  # === 生命周期钩子 ===
                  on_startup: StartupShutdown | None = None,
@@ -185,15 +185,15 @@ class WorkerSettings:
 
                  # === 延迟任务配置 ===
                  enable_delayed_jobs: bool = True,
-                 delay_mechanism: str = "auto",  # auto/plugin/ttl
+                 delay_mechanism: str = "auto",  # auto, delayed_exchange, ttl_dlx
 
                  # === 调试配置 ===
                  debug_mode: bool = False,
-                 trace_tasks: bool = False,
-                 ) -> None:
+                 trace_tasks: bool = False
+                 ):
         """
         初始化 Worker 配置
-
+        
         Args:
             rabbitmq_settings: RabbitMQ 连接配置
             functions: 任务函数列表
@@ -237,50 +237,50 @@ class WorkerSettings:
             debug_mode: 调试模式
             trace_tasks: 追踪任务执行
         """
-        # 基础配置
+        # === 基础配置 ===
         self.rabbitmq_settings = rabbitmq_settings
         self.functions = functions
-        self.worker_name = worker_name or f"worker_{uuid.uuid4().hex[:8]}"
+        self.worker_name = worker_name
 
-        # 队列配置
+        # === 队列配置 ===
         self.queue_name = queue_name
-        self.dlq_name = dlq_name or f"{queue_name}_dlq"
+        self.dlq_name = dlq_name or f"{queue_name}.dlq"  # 默认使用队列名称 + .dlq
         self.queue_durable = queue_durable
         self.queue_exclusive = queue_exclusive
         self.queue_auto_delete = queue_auto_delete
 
-        # 任务处理配置
+        # === 任务处理配置 ===
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.job_timeout = job_timeout
         self.max_concurrent_jobs = max_concurrent_jobs
 
-        # 任务结果配置
+        # === 任务结果配置 ===
         self.enable_job_result_storage = enable_job_result_storage
         self.job_result_ttl = job_result_ttl
 
-        # Worker运行模式配置
+        # === Worker 运行时配置 ===
         self.health_check_interval = health_check_interval
         self.job_completion_wait = job_completion_wait
         self.graceful_shutdown_timeout = graceful_shutdown_timeout
 
-        # Burst模式配置
+        # === Burst 模式配置 ===
         self.burst_mode = burst_mode
         self.burst_timeout = burst_timeout
         self.burst_check_interval = burst_check_interval
         self.burst_wait_for_tasks = burst_wait_for_tasks
         self.burst_exit_on_empty = burst_exit_on_empty
 
-        # 日志配置
+        # === 日志配置 ===
         self.log_level = log_level
         self.log_format = log_format
         self.log_file = log_file
 
-        # 信号处理配置
+        # === 信号处理配置 ===
         self.handle_signals = handle_signals
         self.signal_timeout = signal_timeout
 
-        # 生命周期钩子
+        # === 生命周期钩子 ===
         self.on_startup = on_startup
         self.on_shutdown = on_shutdown
         self.on_job_start = on_job_start
@@ -288,21 +288,21 @@ class WorkerSettings:
         self.on_job_success = on_job_success
         self.on_job_failure = on_job_failure
 
-        # 监控配置
+        # === 监控配置 ===
         self.enable_metrics = enable_metrics
         self.metrics_interval = metrics_interval
         self.enable_health_endpoint = enable_health_endpoint
         self.health_endpoint_port = health_endpoint_port
 
-        # 延迟任务配置
+        # === 延迟任务配置 ===
         self.enable_delayed_jobs = enable_delayed_jobs
         self.delay_mechanism = delay_mechanism
 
-        # 调试配置
+        # === 调试配置 ===
         self.debug_mode = debug_mode
         self.trace_tasks = trace_tasks
 
-        # 配置验证
+        # 验证配置
         self._validate_config()
 
     def _validate_config(self) -> None:
