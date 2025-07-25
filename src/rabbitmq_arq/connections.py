@@ -156,7 +156,7 @@ class WorkerSettings:
                  # === Burst 模式配置 ===
                  burst_mode: bool = False,
                  burst_timeout: int = 300,
-                 burst_check_interval: int = 5,
+                 burst_check_interval: float = 1.5,
                  burst_wait_for_tasks: bool = True,
                  burst_exit_on_empty: bool = True,
 
