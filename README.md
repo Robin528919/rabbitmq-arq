@@ -25,17 +25,14 @@ pip install rabbitmq-arq
 
 ```python
 import asyncio
-from rabbitmq_arq import ArqClient, task
 
-# 定义任务
-@task
+# 定义任务（普通异步函数）
 async def send_email(to: str, subject: str, body: str) -> bool:
     # 你的邮件发送逻辑
     print(f"发送邮件到 {to}: {subject}")
     await asyncio.sleep(1)  # 模拟异步操作
     return True
 
-@task
 async def process_data(data: dict) -> dict:
     # 数据处理逻辑
     result = {"processed": True, "count": len(data)}
@@ -46,21 +43,26 @@ async def process_data(data: dict) -> dict:
 
 ```python
 import asyncio
-from rabbitmq_arq import ArqClient
+from rabbitmq_arq import RabbitMQClient, create_client
+from rabbitmq_arq.connections import RabbitMQSettings
 
 async def main():
     # 创建客户端
-    client = ArqClient("amqp://localhost:5672")
+    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+    client = RabbitMQClient(settings)
     
-    # 入队任务
-    job = await client.enqueue(
-        "send_email",
+    # 连接并发送任务
+    await client.connect()
+    
+    job = await client.enqueue_job(
+        "send_email",  # 任务名称
         to="user@example.com",
         subject="欢迎使用 RabbitMQ ARQ",
         body="这是一个测试邮件"
     )
     
-    print(f"任务已提交: {job.id}")
+    print(f"任务已提交: {job.job_id}")
+    await client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -70,22 +72,29 @@ if __name__ == "__main__":
 
 ```python
 import asyncio
-from rabbitmq_arq import Worker
+from rabbitmq_arq import Worker, WorkerSettings
+from rabbitmq_arq.connections import RabbitMQSettings
 
 async def main():
-    worker = Worker(
-        connection_url="amqp://localhost:5672",
+    # 配置设置
+    rabbitmq_settings = RabbitMQSettings(
+        connection_url="amqp://localhost:5672"
+    )
+    worker_settings = WorkerSettings(
         queues=["default"],
         prefetch_count=5000,  # 高并发处理
         max_workers=10
     )
     
-    # 注册任务
-    worker.register_task(send_email)
-    worker.register_task(process_data)
+    # 创建工作器
+    worker = Worker(rabbitmq_settings, worker_settings)
+    
+    # 注册任务函数
+    worker.add_function(send_email)
+    worker.add_function(process_data)
     
     # 启动工作器
-    await worker.start()
+    await worker.async_run()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -105,52 +114,52 @@ rabbitmq-arq monitor --connection amqp://localhost:5672
 
 ### 错误处理和重试
 
+RabbitMQ-ARQ 具有智能错误分类和自动重试机制：
+
 ```python
 import random
+from rabbitmq_arq.exceptions import Retry
 
-@task(max_retries=3, retry_delay=60)
 async def reliable_task(data: str) -> str:
     # 可能失败的任务，会自动重试
     if random.random() < 0.3:
-        raise Exception("随机错误")
+        # 抛出 Retry 异常进行重试
+        raise Retry("临时错误，需要重试")
     return f"处理完成: {data}"
+
+# 工作器会自动根据错误类型决定是否重试
+# - 网络错误、超时等：自动重试
+# - 代码错误、类型错误等：不重试，直接失败
 ```
 
-### 任务优先级
+### 延迟任务
 
 ```python
 import asyncio
-from rabbitmq_arq import ArqClient
-
-async def main():
-    client = ArqClient("amqp://localhost:5672")
-    
-    # 高优先级任务
-    await client.enqueue("urgent_task", priority=10)
-
-    # 普通任务
-    await client.enqueue("normal_task", priority=1)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-### 定时任务
-
-```python
 from datetime import datetime, timedelta
-
-import asyncio
-from rabbitmq_arq import ArqClient
+from rabbitmq_arq import RabbitMQClient
+from rabbitmq_arq.connections import RabbitMQSettings
 
 async def main():
-    client = ArqClient("amqp://localhost:5672")
+    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+    client = RabbitMQClient(settings)
+    await client.connect()
     
-    # 延迟执行
-    await client.enqueue("delayed_task", defer_until=datetime.now() + timedelta(hours=1))
-
-    # 定时执行
-    await client.enqueue("scheduled_task", defer_until=datetime(2024, 1, 1, 9, 0, 0))
+    # 延迟执行（1小时后）
+    job = await client.enqueue_job(
+        "delayed_task",
+        data={"message": "延迟任务"},
+        defer_until=datetime.now() + timedelta(hours=1)
+    )
+    
+    # 定时执行（指定时间）
+    job = await client.enqueue_job(
+        "scheduled_task", 
+        data={"message": "定时任务"},
+        defer_until=datetime(2025, 1, 1, 9, 0, 0)
+    )
+    
+    await client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -167,51 +176,65 @@ class FollowersConsumer(BaseConsumer):
         # 处理逻辑
         pass
 
-# 新代码
-@task
+# 新代码（只需定义普通异步函数）
 async def process_followers(data: dict):
     # 相同的处理逻辑
     pass
-```
 
-详细迁移指南请参考 [examples/migration_from_existing.py](examples/migration_from_existing.py)。
+# 然后在 Worker 中注册
+worker.add_function(process_followers)
+```
 
 ## 性能优化
 
-### 批量处理
+### 高并发配置
 
 ```python
-import asyncio
-from rabbitmq_arq import ArqClient, task
+from rabbitmq_arq import Worker, WorkerSettings
+from rabbitmq_arq.connections import RabbitMQSettings
 
-async def main():
-    client = ArqClient("amqp://localhost:5672")
-    
-    # 批量处理
-    await client.enqueue_many(
-        [
-            ("batch_task_1", {"item": "data1"}),
-            ("batch_task_2", {"item": "data2"}),
-            ("batch_task_3", {"item": "data3"}),
-        ]
-    )
+# 高性能配置
+rabbitmq_settings = RabbitMQSettings(
+    connection_url="amqp://localhost:5672"
+)
+worker_settings = WorkerSettings(
+    queues=["high_performance"],
+    prefetch_count=5000,     # 高预取数量
+    max_workers=20,          # 增加并发工作器
+    burst_check_interval=1.0, # 快速检查
+    health_check_interval=30  # 健康检查间隔
+)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+worker = Worker(rabbitmq_settings, worker_settings)
 ```
 
-### 连接池配置
+### 批量任务提交
 
 ```python
 import asyncio
-from rabbitmq_arq import ArqClient
+from rabbitmq_arq import RabbitMQClient
+from rabbitmq_arq.connections import RabbitMQSettings
 
 async def main():
-    client = ArqClient(
-        connection_url="amqp://localhost:5672",
-        pool_size=20,
-        max_overflow=30
-    )
+    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+    client = RabbitMQClient(settings)
+    await client.connect()
+    
+    # 批量提交任务
+    tasks = []
+    for i in range(100):
+        task = client.enqueue_job(
+            "batch_task",
+            item_id=i,
+            data=f"batch_data_{i}"
+        )
+        tasks.append(task)
+    
+    # 等待所有任务提交完成
+    jobs = await asyncio.gather(*tasks)
+    print(f"提交了 {len(jobs)} 个任务")
+    
+    await client.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -221,16 +244,26 @@ if __name__ == "__main__":
 
 ### 结构化日志
 
+RabbitMQ-ARQ 内置中文友好的日志系统：
+
 ```python
-import structlog
+import logging
 
-logger = structlog.get_logger()
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
-@task
 async def logged_task(data: dict):
-    logger.info("任务开始", task_data=data)
+    logger = logging.getLogger('rabbitmq-arq.task')
+    logger.info(f"任务开始处理: {data}")
+    
     # 处理逻辑
-    logger.info("任务完成", result="success")
+    result = {"processed": True, "data": data}
+    
+    logger.info(f"任务处理完成: {result}")
+    return result
 ```
 
 ### 监控指标
@@ -251,6 +284,10 @@ rabbitmq-arq 自动收集以下指标：
 git clone https://github.com/your-username/rabbitmq-arq.git
 cd rabbitmq-arq
 
+# 创建并激活 conda 环境
+conda create -n rabbitmq_arq python=3.12
+conda activate rabbitmq_arq
+
 # 安装开发依赖
 pip install -e ".[dev]"
 
@@ -261,14 +298,22 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 ### 运行测试
 
 ```bash
+# 确保在正确的环境中
+conda activate rabbitmq_arq
+
 # 运行所有测试
 pytest
 
 # 运行带覆盖率的测试
-pytest --cov=rabbitmq_arq
+pytest --cov=rabbitmq_arq --cov-report=html --cov-report=term-missing
 
-# 运行性能测试
-pytest -m performance
+# 运行特定类型的测试
+pytest -m error_handling    # 错误处理测试
+pytest -m integration       # 集成测试
+pytest -m slow             # 长时间运行的测试
+
+# 运行单个测试文件
+pytest tests/test_error_handling.py
 ```
 
 ### 代码格式化
