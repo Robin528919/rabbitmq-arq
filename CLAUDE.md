@@ -88,6 +88,12 @@ pip install -e ".[dev]"
 - 代码注释使用中文
 - 始终在 `rabbitmq_arq` conda 虚拟环境中工作
 
+### RabbitMQ 消息消费规则
+- **禁止使用 GET API**: 严禁使用 RabbitMQ 的 GET API（如 `basic_get`）获取消息，这种方式是轮询模式，性能极差
+- **必须使用 CONSUME 模式**: 只能使用 `basic_consume` 消费者模式，通过回调函数异步处理消息
+- **推荐模式**: 使用 aio-pika 的 `queue.consume()` 或 `queue.iterator()` 方法进行消息消费
+- **性能考虑**: GET 方式会导致频繁的网络往返，严重影响性能，而 CONSUME 方式是推送模式，性能更优
+
 ### 架构模式
 - **错误分类**: `worker.py` 中的 `ErrorClassification` 类定义可重试与不可重试错误，用于智能重试策略
 - **配置管理**: 使用 Pydantic 配置类（`WorkerSettings`、`RabbitMQSettings`）进行配置管理
