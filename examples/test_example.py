@@ -1,191 +1,239 @@
 # -*- coding: utf-8 -*-
 # @version        : 1.0
-# @Create Time    : 2025/5/9 22:00
+# @Create Time    : 2025/5/9 21:00
 # @File           : test_example
 # @IDE            : PyCharm
-# @desc           : 测试 example.py 修复是否有效
+# @desc           : 测试 RabbitMQ-ARQ 修复效果
 
 import asyncio
+import logging
 import sys
 import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 添加项目根目录到 Python 路径
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-
-from rabbitmq_arq import (
+from src.rabbitmq_arq import (
+    Worker,
+    WorkerSettings,
     RabbitMQClient,
     RabbitMQSettings,
     JobContext,
     Retry
 )
 
-# 简单的配置测试
-def test_settings():
-    """测试 RabbitMQSettings 配置"""
-    print("📋 测试 RabbitMQSettings 配置...")
-    
-    settings = RabbitMQSettings(
-        rabbitmq_url="amqp://guest:guest@localhost:5672/",
-        rabbitmq_queue="test_queue",
-        max_retries=3,
-        retry_backoff=5.0,
-        job_timeout=300,
-        prefetch_count=100,
-        log_level="INFO"
-    )
-    
-    assert settings.rabbitmq_url == "amqp://guest:guest@localhost:5672/"
-    assert settings.rabbitmq_queue == "test_queue"
-    assert settings.max_retries == 3
-    
-    print("✅ RabbitMQSettings 配置测试通过")
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger('test_example')
+
+# RabbitMQ 连接配置
+rabbitmq_settings = RabbitMQSettings(
+    rabbitmq_url="amqp://guest:guest@localhost:5672/",
+    prefetch_count=10,
+    connection_timeout=30,
+)
 
 
-def test_job_context():
-    """测试 JobContext 模型"""
-    print("📋 测试 JobContext 模型...")
+# === 测试任务函数 ===
+
+async def test_basic_task(ctx: JobContext, task_name: str, data: dict):
+    """基础任务测试"""
+    logger.info(f"🔬 执行基础任务: {task_name}")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   数据: {data}")
     
-    from datetime import datetime
+    await asyncio.sleep(0.5)
     
-    ctx = JobContext(
-        job_id="test-job-123",
-        job_try=1,
-        enqueue_time=datetime.now(),
-        start_time=datetime.now(),
-        queue_name="test_queue",
-        worker_id="worker-456",
-        extra={"custom_data": "test"}
-    )
-    
-    # 测试 Pydantic V2 model_dump 方法
-    data = ctx.model_dump()
-    assert data['job_id'] == "test-job-123"
-    assert data['job_try'] == 1
-    assert data['extra']['custom_data'] == "test"
-    
-    print("✅ JobContext 模型测试通过")
+    logger.info(f"✅ 基础任务 {task_name} 完成")
+    return {"task_name": task_name, "status": "completed", "data": data}
 
 
-async def test_task_functions():
-    """测试任务函数"""
-    print("📋 测试任务函数...")
+async def test_retry_task(ctx: JobContext, retry_count: int = 2):
+    """重试任务测试"""
+    logger.info(f"🔄 执行重试任务测试")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   当前尝试: {ctx.job_try}")
+    logger.info(f"   预期重试: {retry_count} 次")
     
-    from datetime import datetime
+    if ctx.job_try <= retry_count:
+        logger.warning(f"💥 任务失败，进行重试 ({ctx.job_try}/{retry_count})")
+        raise Retry(defer=1)  # 1秒后重试
     
-    # 模拟 JobContext
-    ctx = JobContext(
-        job_id="test-job-123",
-        job_try=1,
-        enqueue_time=datetime.now(),
-        start_time=datetime.now(),
-        queue_name="test_queue",
-        worker_id="worker-456"
-    )
+    logger.info(f"✅ 重试任务最终成功")
+    return {"retry_count": ctx.job_try - 1, "status": "completed"}
+
+
+async def test_delayed_task(ctx: JobContext, message: str):
+    """延迟任务测试"""
+    logger.info(f"⏰ 执行延迟任务: {message}")
+    logger.info(f"   任务ID: {ctx.job_id}")
     
-    # 测试简单任务函数
-    async def simple_task(ctx: JobContext, message: str):
-        return f"处理完成: {message}"
+    await asyncio.sleep(0.2)
     
-    result = await simple_task(ctx, "测试消息")
-    assert result == "处理完成: 测试消息"
+    logger.info(f"✅ 延迟任务完成: {message}")
+    return {"message": message, "status": "completed"}
+
+
+# === 生命周期钩子 ===
+
+async def test_startup(ctx: dict):
+    """测试启动钩子"""
+    logger.info("🚀 测试 Worker 启动中...")
+    ctx['test_stats'] = {
+        'start_time': asyncio.get_event_loop().time(),
+        'jobs_processed': 0,
+        'jobs_completed': 0,
+        'jobs_failed': 0,
+        'jobs_retried': 0
+    }
+    logger.info("✅ 测试 Worker 准备就绪")
+
+
+async def test_shutdown(ctx: dict):
+    """测试关闭钩子"""
+    logger.info("🛑 测试 Worker 正在关闭...")
     
-    # 测试重试机制
-    async def retry_task(ctx: JobContext, should_retry: bool):
-        if should_retry and ctx.job_try < 2:
-            raise Retry(defer=1)
-        return "任务成功"
+    stats = ctx.get('test_stats', {})
+    start_time = stats.get('start_time', 0)
+    current_time = asyncio.get_event_loop().time()
+    runtime = current_time - start_time if start_time else 0
     
-    # 第一次调用应该抛出 Retry
+    logger.info("📊 测试运行统计:")
+    logger.info(f"   运行时间: {runtime:.2f} 秒")
+    logger.info(f"   处理任务: {stats.get('jobs_processed', 0)} 个")
+    logger.info(f"   成功任务: {stats.get('jobs_completed', 0)} 个")
+    logger.info(f"   失败任务: {stats.get('jobs_failed', 0)} 个")
+    logger.info(f"   重试任务: {stats.get('jobs_retried', 0)} 个")
+    
+    logger.info("✅ 测试 Worker 已关闭")
+
+
+async def job_start_hook(ctx: dict):
+    """任务开始钩子"""
+    stats = ctx.get('test_stats', {})
+    stats['jobs_processed'] = stats.get('jobs_processed', 0) + 1
+
+
+async def job_end_hook(ctx: dict):
+    """任务结束钩子"""
+    stats = ctx.get('test_stats', {})
+    job_status = ctx.get('job_status')
+    
+    if job_status == 'completed':
+        stats['jobs_completed'] = stats.get('jobs_completed', 0) + 1
+    elif job_status == 'failed':
+        stats['jobs_failed'] = stats.get('jobs_failed', 0) + 1
+    elif job_status == 'retried':
+        stats['jobs_retried'] = stats.get('jobs_retried', 0) + 1
+
+
+# === Worker 配置 ===
+
+# 测试 Worker 配置
+test_worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[test_basic_task, test_retry_task, test_delayed_task],
+    worker_name="test_worker",
+    
+    # 队列配置
+    queue_name="test_queue",
+    dlq_name="test_queue_dlq",
+    
+    # 任务处理配置
+    max_retries=3,
+    retry_backoff=1.0,
+    job_timeout=30,
+    max_concurrent_jobs=3,
+    
+    # Burst 模式配置（用于测试）
+    burst_mode=True,
+    burst_timeout=60,
+    burst_check_interval=1.0,
+    burst_wait_for_tasks=True,
+    
+    # 生命周期钩子
+    on_startup=test_startup,
+    on_shutdown=test_shutdown,
+    on_job_start=job_start_hook,
+    on_job_end=job_end_hook,
+    
+    # 日志配置
+    log_level="INFO",
+)
+
+
+# === 测试函数 ===
+
+async def test_basic_functionality():
+    """测试基本功能"""
+    logger.info("🧪 开始基本功能测试")
+    
+    client = RabbitMQClient(rabbitmq_settings)
+    
     try:
-        await retry_task(ctx, True)
-        assert False, "应该抛出 Retry 异常"
-    except Retry as e:
-        assert e.defer == 1
-    
-    # 第二次调用应该成功
-    ctx.job_try = 2
-    result = await retry_task(ctx, True)
-    assert result == "任务成功"
-    
-    print("✅ 任务函数测试通过")
-
-
-def test_client_creation():
-    """测试客户端创建"""
-    print("📋 测试客户端创建...")
-    
-    settings = RabbitMQSettings(
-        rabbitmq_url="amqp://guest:guest@localhost:5672/",
-        rabbitmq_queue="test_queue"
-    )
-    
-    client = RabbitMQClient(settings)
-    assert client.rabbitmq_settings.rabbitmq_queue == "test_queue"
-    
-    print("✅ 客户端创建测试通过")
-
-
-def test_hook_functions():
-    """测试钩子函数"""
-    print("📋 测试钩子函数...")
-    
-    # 测试钩子函数签名
-    async def test_startup(ctx: dict):
-        ctx['initialized'] = True
-        return ctx
-    
-    async def test_job_start(ctx: dict):
-        job_id = ctx.get('job_id', 'unknown')
-        return f"开始任务 {job_id}"
-    
-    # 模拟调用
-    startup_ctx = {}
-    result = asyncio.run(test_startup(startup_ctx))
-    assert result['initialized'] is True
-    
-    job_ctx = {'job_id': 'test-123', 'job_try': 1}
-    result = asyncio.run(test_job_start(job_ctx))
-    assert result == "开始任务 test-123"
-    
-    print("✅ 钩子函数测试通过")
-
-
-def main():
-    """运行所有测试"""
-    print("🚀 开始运行 RabbitMQ-ARQ 修复验证测试...\n")
-    
-    try:
-        # 基本配置测试
-        test_settings()
-        print()
+        await client.connect()
+        logger.info("✅ 客户端连接成功")
         
-        # 模型测试
-        test_job_context()
-        print()
+        # 测试基础任务提交
+        job1 = await client.enqueue_job(
+            "test_basic_task",
+            task_name="基础测试",
+            data={"test": True, "number": 123},
+            queue_name="test_queue"
+        )
+        logger.info(f"✅ 基础任务已提交: {job1.job_id}")
         
-        # 任务函数测试
-        asyncio.run(test_task_functions())
-        print()
+        # 测试重试任务
+        job2 = await client.enqueue_job(
+            "test_retry_task",
+            retry_count=2,
+            queue_name="test_queue"
+        )
+        logger.info(f"✅ 重试任务已提交: {job2.job_id}")
         
-        # 客户端测试
-        test_client_creation()
-        print()
+        # 测试延迟任务
+        job3 = await client.enqueue_job(
+            "test_delayed_task",
+            message="这是一个延迟3秒的任务",
+            queue_name="test_queue",
+            _defer_by=3
+        )
+        logger.info(f"✅ 延迟任务已提交: {job3.job_id}")
         
-        # 钩子函数测试
-        test_hook_functions()
-        print()
-        
-        print("🎉 所有测试通过！example.py 修复成功！")
-        print("\n📝 可以运行以下命令进行完整测试：")
-        print("1. 运行 Worker: python examples/example.py worker")
-        print("2. 提交任务: python examples/example.py")
+        logger.info("🎉 所有测试任务已提交")
         
     except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        logger.error(f"❌ 测试失败: {e}")
+        raise
+    finally:
+        await client.close()
+        logger.info("客户端连接已关闭")
+
+
+async def run_test_worker():
+    """运行测试 Worker"""
+    logger.info("🚀 启动测试 Worker")
+    worker = Worker(test_worker_settings)
+    await worker.main()
 
 
 if __name__ == "__main__":
-    main() 
+    import sys
+    
+    if len(sys.argv) > 1:
+        command = sys.argv[1]
+        
+        if command == "worker":
+            # 运行测试 Worker
+            asyncio.run(run_test_worker())
+        else:
+            logger.error(f"❌ 未知命令: {command}")
+            logger.info("💡 可用命令:")
+            logger.info("  python test_example.py        # 提交测试任务")
+            logger.info("  python test_example.py worker # 启动测试 Worker")
+    else:
+        # 提交测试任务
+        logger.info("启动测试模式...")
+        asyncio.run(test_basic_functionality()) 

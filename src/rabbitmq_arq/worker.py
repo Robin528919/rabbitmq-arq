@@ -18,7 +18,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from functools import partial
 from signal import Signals
-from typing import Any
+from typing import Any, Union, Type
 
 from aio_pika import connect_robust, IncomingMessage, Message
 
@@ -929,7 +929,7 @@ class Worker(WorkerUtils):
                 logger.info("已关闭 RabbitMQ 连接")
 
     @classmethod
-    def run(cls, worker_settings):
+    def run(cls, worker_settings: WorkerSettings):
         """
         运行 Worker 的类方法
         

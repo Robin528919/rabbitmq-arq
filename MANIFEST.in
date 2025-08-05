@@ -1,0 +1,44 @@
+# 包含项目根目录的重要文件
+include README.md
+include LICENSE
+include pyproject.toml
+include requirements*.txt
+include .bumpversion.cfg
+
+# 包含文档
+recursive-include docs *.md *.rst *.txt
+recursive-include docs *.py
+
+# 包含示例
+recursive-include examples *.py *.md *.txt
+
+# 包含源码中的非 Python 文件
+recursive-include src *.md *.txt *.json *.yaml *.yml
+
+# 排除不需要的文件
+exclude .gitignore
+exclude .pre-commit-config.yaml
+exclude *.pyc
+exclude *.pyo
+exclude *.pyd
+exclude .Python
+exclude pip-log.txt
+exclude pip-delete-this-directory.txt
+
+# 排除测试和开发文件
+exclude tox.ini
+exclude .coverage
+exclude .pytest_cache
+recursive-exclude tests *.pyc
+recursive-exclude tests *.pyo
+
+# 排除 IDE 和编辑器文件
+recursive-exclude . *.swp *.swo
+exclude .vscode
+exclude .idea
+exclude *.sublime-*
+
+# 排除构建文件
+exclude build
+exclude dist
+recursive-exclude *.egg-info * 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # @version        : 1.0
-# @Create Time    : 2025/5/9 23:00
+# @Create Time    : 2025/5/9 22:00
 # @File           : burst_example
 # @IDE            : PyCharm
 # @desc           : RabbitMQ-ARQ Burst 模式使用示例
@@ -8,17 +8,20 @@
 import asyncio
 import logging
 from typing import Dict, Any
-import time
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.rabbitmq_arq import (
     Worker,
+    WorkerSettings,
     RabbitMQClient,
     RabbitMQSettings,
     JobContext,
     Retry
 )
 
-# 配置中文日志
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -27,267 +30,276 @@ logging.basicConfig(
     ]
 )
 
-# 创建专门的日志对象
-logger = logging.getLogger('burst_example')
-task_logger = logging.getLogger('burst_task')
+logger = logging.getLogger('rabbitmq_arq.burst_example')
 
-# 设置日志级别
-logger.setLevel(logging.INFO)
-task_logger.setLevel(logging.INFO)
-
-# Burst 模式配置
-burst_settings = RabbitMQSettings(
+# RabbitMQ 连接配置
+rabbitmq_settings = RabbitMQSettings(
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="burst_demo_queue",
-    max_retries=2,
-    retry_backoff=3.0,
-    job_timeout=60,
-    prefetch_count=10,
-    log_level="INFO",
-    # 关键：启用 burst 模式
-    burst_mode=True,
-    burst_timeout=120,  # 最多运行2分钟
-    burst_check_interval=2.0,  # 每2秒检查一次
-    burst_wait_for_tasks=True  # 退出前等待任务完成
-)
-
-# 常规模式配置（对比用）
-normal_settings = RabbitMQSettings(
-    rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="burst_demo_queue",
-    max_retries=2,
-    retry_backoff=3.0,
-    job_timeout=60,
-    prefetch_count=10,
-    log_level="INFO",
-    burst_mode=False  # 常规模式
+    prefetch_count=50,
+    connection_timeout=30,
 )
 
 
-# 定义批处理任务函数
-async def process_data_batch(ctx: JobContext, batch_id: int, data_count: int, processing_time: float = 1.0):
-    """批量数据处理任务"""
-    task_logger.info(f"📦 开始处理批次 {batch_id}，包含 {data_count} 条数据")
-    task_logger.info(f"任务 ID: {ctx.job_id}")
-    task_logger.info(f"尝试次数: {ctx.job_try}")
-    
-    # 模拟数据处理
-    start_time = time.time()
-    await asyncio.sleep(processing_time)
-    elapsed = time.time() - start_time
-    
-    # 模拟偶尔失败的情况
-    if batch_id % 7 == 0 and ctx.job_try < 2:
-        task_logger.warning(f"批次 {batch_id} 处理失败，需要重试")
-        raise Retry(defer=2)  # 2秒后重试
-    
-    result = {
-        "batch_id": batch_id,
-        "data_count": data_count,
-        "processing_time": elapsed,
-        "status": "completed"
-    }
-    
-    task_logger.info(f"✅ 批次 {batch_id} 处理完成，耗时 {elapsed:.2f}s")
-    return result
+# === 任务函数定义 ===
 
-
-async def generate_report(ctx: JobContext, report_type: str, data_range: str):
-    """生成报告任务"""
-    task_logger.info(f"📊 开始生成 {report_type} 报告，数据范围: {data_range}")
+async def simple_task(ctx: JobContext, task_id: int, message: str):
+    """
+    简单的任务函数，用于测试 Burst 模式
+    """
+    logger.info(f"📋 执行任务 {task_id}: {message}")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   尝试次数: {ctx.job_try}")
     
-    # 模拟报告生成
-    await asyncio.sleep(2)
-    
-    result = {
-        "report_type": report_type,
-        "data_range": data_range,
-        "generated_at": asyncio.get_event_loop().time(),
-        "status": "generated"
-    }
-    
-    task_logger.info(f"✅ {report_type} 报告生成完成")
-    return result
-
-
-async def cleanup_task(ctx: JobContext, cleanup_type: str):
-    """清理任务"""
-    task_logger.info(f"🧹 开始执行 {cleanup_type} 清理")
-    
-    # 模拟清理工作
+    # 模拟任务处理时间
     await asyncio.sleep(0.5)
     
-    task_logger.info(f"✅ {cleanup_type} 清理完成")
-    return {"cleanup_type": cleanup_type, "status": "cleaned"}
+    logger.info(f"✅ 任务 {task_id} 完成")
+    return {"task_id": task_id, "status": "completed", "message": message}
 
 
-# Worker 钩子函数
-async def burst_startup(ctx: Dict[Any, Any]):
+async def long_task(ctx: JobContext, duration: int):
+    """
+    长时间运行的任务，用于测试 Worker 等待机制
+    """
+    logger.info(f"⏳ 开始执行长任务，预计耗时 {duration} 秒")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    
+    for i in range(duration):
+        await asyncio.sleep(1)
+        logger.info(f"   长任务进度: {i+1}/{duration} 秒")
+    
+    logger.info(f"✅ 长任务完成，耗时 {duration} 秒")
+    return {"duration": duration, "status": "completed"}
+
+
+async def failing_task(ctx: JobContext, should_fail: bool = True):
+    """
+    会失败的任务，用于测试重试机制
+    """
+    logger.info(f"🎯 执行可能失败的任务")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   尝试次数: {ctx.job_try}")
+    
+    await asyncio.sleep(0.2)
+    
+    if should_fail and ctx.job_try <= 2:
+        logger.warning(f"💥 任务失败，准备重试 (尝试次数: {ctx.job_try})")
+        raise Retry(defer=2)  # 2秒后重试
+    
+    logger.info(f"✅ 任务最终成功")
+    return {"try_count": ctx.job_try, "status": "completed"}
+
+
+# === 生命周期钩子 ===
+
+async def burst_startup(ctx: dict):
     """Burst Worker 启动钩子"""
-    logger.info("🚀 Burst 模式 Worker 启动")
-    ctx['start_time'] = time.time()
-    ctx['batch_processed'] = 0
+    logger.info("🚀 Burst Worker 启动中...")
+    ctx['burst_stats'] = {
+        'start_time': asyncio.get_event_loop().time(),
+        'jobs_processed': 0,
+        'jobs_completed': 0,
+        'jobs_failed': 0
+    }
+    logger.info("✅ Burst Worker 准备就绪")
 
 
-async def burst_shutdown(ctx: Dict[Any, Any]):
+async def burst_shutdown(ctx: dict):
     """Burst Worker 关闭钩子"""
-    elapsed = time.time() - ctx.get('start_time', time.time())
-    logger.info(f"🏁 Burst 模式 Worker 关闭，总运行时间: {elapsed:.2f}s")
-    logger.info(f"📊 处理的批次数: {ctx.get('batch_processed', 0)}")
-
-
-async def burst_job_start(ctx: Dict[Any, Any]):
-    """Burst 任务开始钩子"""
-    job_id = ctx.get('job_id', 'unknown')
-    worker_stats = ctx.get('worker_stats', {})
+    logger.info("🏁 Burst Worker 正在关闭...")
     
-    logger.info(f"🔄 开始处理任务 {job_id}")
-    logger.debug(f"当前统计: {worker_stats}")
-
-
-async def burst_job_end(ctx: Dict[Any, Any]):
-    """Burst 任务结束钩子"""
-    job_id = ctx.get('job_id', 'unknown')
-    worker_stats = ctx.get('worker_stats', {})
+    stats = ctx.get('burst_stats', {})
+    start_time = stats.get('start_time', 0)
+    current_time = asyncio.get_event_loop().time()
+    runtime = current_time - start_time if start_time else 0
     
-    # 更新批次计数
-    if 'batch_processed' in ctx:
-        ctx['batch_processed'] += 1
+    logger.info("📊 Burst 运行统计:")
+    logger.info(f"   运行时间: {runtime:.2f} 秒")
+    logger.info(f"   处理任务: {stats.get('jobs_processed', 0)} 个")
+    logger.info(f"   成功任务: {stats.get('jobs_completed', 0)} 个")
+    logger.info(f"   失败任务: {stats.get('jobs_failed', 0)} 个")
     
-    logger.info(f"✅ 任务 {job_id} 处理完成")
-    logger.info(f"📈 进度: 完成 {worker_stats.get('jobs_complete', 0)} 个任务")
+    logger.info("✅ Burst Worker 已关闭")
 
 
-# Burst Worker 配置
-class BurstWorkerSettings:
-    """Burst 模式 Worker 配置"""
-    functions = [process_data_batch, generate_report, cleanup_task]
-    rabbitmq_settings = burst_settings
-    on_startup = burst_startup
-    on_shutdown = burst_shutdown
-    on_job_start = burst_job_start
-    on_job_end = burst_job_end
-    ctx = {"mode": "burst", "environment": "demo"}
+async def job_start(ctx: dict):
+    """任务开始钩子"""
+    stats = ctx.get('burst_stats', {})
+    stats['jobs_processed'] = stats.get('jobs_processed', 0) + 1
 
 
-# 常规 Worker 配置（对比用）
-class NormalWorkerSettings:
-    """常规模式 Worker 配置"""
-    functions = [process_data_batch, generate_report, cleanup_task]
-    rabbitmq_settings = normal_settings
-    on_startup = burst_startup
-    on_shutdown = burst_shutdown
-    on_job_start = burst_job_start
-    on_job_end = burst_job_end
-    ctx = {"mode": "normal", "environment": "demo"}
+async def job_end(ctx: dict):
+    """任务结束钩子"""
+    stats = ctx.get('burst_stats', {})
+    if ctx.get('job_status') == 'completed':
+        stats['jobs_completed'] = stats.get('jobs_completed', 0) + 1
+    elif ctx.get('job_status') == 'failed':
+        stats['jobs_failed'] = stats.get('jobs_failed', 0) + 1
 
 
-async def submit_batch_jobs():
-    """提交批处理任务示例"""
-    logger.info("📝 开始提交批处理任务...")
+# === Worker 配置 ===
+
+# Burst 模式 Worker 配置 - 快速处理
+burst_worker_fast = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[simple_task, long_task, failing_task],
+    worker_name="burst_worker_fast",
     
-    # 创建客户端（使用任意一个设置，只是为了提交任务）
-    client = RabbitMQClient(burst_settings)
+    # 队列配置
+    queue_name="burst_test_queue",
+    dlq_name="burst_test_queue_dlq",
+    
+    # 任务处理配置
+    max_retries=3,
+    retry_backoff=2.0,
+    job_timeout=60,
+    max_concurrent_jobs=5,
+    
+    # Burst 模式配置 - 快速退出
+    burst_mode=True,
+    burst_timeout=60,  # 1分钟超时
+    burst_check_interval=0.5,  # 0.5秒检查一次
+    burst_wait_for_tasks=False,  # 不等待任务完成
+    burst_exit_on_empty=True,
+    
+    # 生命周期钩子
+    on_startup=burst_startup,
+    on_shutdown=burst_shutdown,
+    on_job_start=job_start,
+    on_job_end=job_end,
+    
+    # 日志配置
+    log_level="INFO",
+)
+
+# Burst 模式 Worker 配置 - 等待任务完成
+burst_worker_patient = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[simple_task, long_task, failing_task],
+    worker_name="burst_worker_patient",
+    
+    # 队列配置
+    queue_name="burst_test_queue",
+    dlq_name="burst_test_queue_dlq",
+    
+    # 任务处理配置
+    max_retries=3,
+    retry_backoff=2.0,
+    job_timeout=120,
+    max_concurrent_jobs=3,
+    
+    # Burst 模式配置 - 等待任务完成
+    burst_mode=True,
+    burst_timeout=300,  # 5分钟超时
+    burst_check_interval=1.0,  # 1秒检查一次
+    burst_wait_for_tasks=True,  # 等待任务完成
+    burst_exit_on_empty=True,
+    
+    # 生命周期钩子
+    on_startup=burst_startup,
+    on_shutdown=burst_shutdown,
+    on_job_start=job_start,
+    on_job_end=job_end,
+    
+    # 日志配置
+    log_level="INFO",
+)
+
+
+# === 主函数：提交测试任务 ===
+
+async def submit_test_tasks():
+    """提交一批测试任务"""
+    logger.info("📤 开始提交 Burst 模式测试任务")
+    
+    client = RabbitMQClient(rabbitmq_settings)
     
     try:
-        logger.info("正在连接到 RabbitMQ...")
+        await client.connect()
+        logger.info("✅ 已连接到 RabbitMQ")
         
-        # 提交多个批处理任务
-        batch_jobs = []
-        for i in range(1, 16):  # 提交15个批次
+        # 提交快速任务
+        logger.info("📋 提交快速任务...")
+        for i in range(5):
             job = await client.enqueue_job(
-                "process_data_batch",
-                i,  # batch_id
-                100 + i * 10,  # data_count
-                1.0 + (i % 3) * 0.5  # processing_time
+                "simple_task",
+                task_id=i + 1,
+                message=f"快速任务 {i + 1}",
+                queue_name="burst_test_queue"
             )
-            batch_jobs.append(job)
-            logger.info(f"📦 已提交批次 {i} 处理任务: {job.job_id}")
+            logger.info(f"   ✅ 快速任务 {i + 1} 已提交: {job.job_id}")
         
-        # 提交报告生成任务
-        report_jobs = []
-        for report_type in ["daily", "weekly", "monthly"]:
-            job = await client.enqueue_job(
-                "generate_report",
-                report_type,
-                "2025-01-01 to 2025-01-31"
-            )
-            report_jobs.append(job)
-            logger.info(f"📊 已提交 {report_type} 报告任务: {job.job_id}")
-        
-        # 提交清理任务
-        cleanup_job = await client.enqueue_job(
-            "cleanup_task",
-            "temp_files"
+        # 提交长时间任务
+        logger.info("⏳ 提交长时间任务...")
+        long_job = await client.enqueue_job(
+            "long_task",
+            duration=10,
+            queue_name="burst_test_queue"
         )
-        logger.info(f"🧹 已提交清理任务: {cleanup_job.job_id}")
+        logger.info(f"   ✅ 长时间任务已提交: {long_job.job_id}")
         
-        total_jobs = len(batch_jobs) + len(report_jobs) + 1
-        logger.info(f"🎉 所有任务提交完成！总计 {total_jobs} 个任务")
-        logger.info("💡 现在可以运行 Worker 来处理这些任务:")
-        logger.info("   python burst_example.py burst-worker   # Burst 模式")
-        logger.info("   python burst_example.py normal-worker  # 常规模式")
+        # 提交会失败重试的任务
+        logger.info("💥 提交失败重试任务...")
+        for i in range(2):
+            fail_job = await client.enqueue_job(
+                "failing_task",
+                should_fail=True,
+                queue_name="burst_test_queue"
+            )
+            logger.info(f"   ✅ 失败重试任务 {i + 1} 已提交: {fail_job.job_id}")
+        
+        logger.info("🎉 所有测试任务已提交完成")
+        logger.info("   快速任务: 5 个")
+        logger.info("   长时间任务: 1 个")
+        logger.info("   失败重试任务: 2 个")
+        logger.info("")
+        logger.info("💡 接下来你可以:")
+        logger.info("   python burst_example.py fast      # 启动快速 Burst Worker (不等待)")
+        logger.info("   python burst_example.py patient   # 启动耐心 Burst Worker (等待完成)")
         
     except Exception as e:
         logger.error(f"❌ 任务提交失败: {e}")
         raise
     finally:
-        logger.info("正在关闭客户端连接...")
         await client.close()
         logger.info("客户端连接已关闭")
 
 
-async def clear_queue():
-    """清空队列（用于测试）"""
-    logger.info("🗑️ 清空队列中的所有消息...")
-    
-    from aio_pika import connect_robust
-    
-    connection = await connect_robust(burst_settings.rabbitmq_url)
-    channel = await connection.channel()
-    
-    try:
-        queue = await channel.declare_queue(burst_settings.rabbitmq_queue, durable=True)
-        purged_count = await queue.purge()
-        logger.info(f"✅ 已清空 {purged_count} 条消息")
-    finally:
-        await connection.close()
-
-
-def main():
-    """主函数"""
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("🚀 RabbitMQ-ARQ Burst 模式示例")
-        print("\n📋 可用命令:")
-        print("  submit        - 提交批处理任务")
-        print("  burst-worker  - 启动 Burst 模式 Worker")
-        print("  normal-worker - 启动常规模式 Worker")
-        print("  clear         - 清空队列")
-        print("\n💡 使用示例:")
-        print("  python burst_example.py submit        # 提交任务")
-        print("  python burst_example.py burst-worker  # 处理任务（Burst 模式）")
-        return
-    
-    command = sys.argv[1]
-    
-    if command == "submit":
-        logger.info("启动任务提交模式...")
-        asyncio.run(submit_batch_jobs())
-    elif command == "burst-worker":
-        logger.info("启动 Burst 模式 Worker...")
-        Worker.run(BurstWorkerSettings)
-    elif command == "normal-worker":
-        logger.info("启动常规模式 Worker...")
-        Worker.run(NormalWorkerSettings)
-    elif command == "clear":
-        logger.info("清空队列模式...")
-        asyncio.run(clear_queue())
+async def run_burst_worker(worker_type: str):
+    """运行指定类型的 Burst Worker"""
+    if worker_type == "fast":
+        logger.info("🚀 启动快速 Burst Worker (不等待任务完成)")
+        worker = Worker(burst_worker_fast)
+    elif worker_type == "patient":
+        logger.info("🚀 启动耐心 Burst Worker (等待任务完成)")
+        worker = Worker(burst_worker_patient)
     else:
-        logger.error(f"❌ 未知命令: {command}")
-        sys.exit(1)
+        raise ValueError(f"不支持的 Worker 类型: {worker_type}")
+    
+    await worker.main()
 
 
 if __name__ == "__main__":
-    main() 
+    import sys
+    
+    if len(sys.argv) > 1:
+        command = sys.argv[1]
+        
+        if command == "fast":
+            # 运行快速 Burst Worker
+            asyncio.run(run_burst_worker("fast"))
+            
+        elif command == "patient":
+            # 运行耐心 Burst Worker
+            asyncio.run(run_burst_worker("patient"))
+            
+        else:
+            logger.error(f"❌ 未知命令: {command}")
+            logger.info("💡 可用命令:")
+            logger.info("  python burst_example.py          # 提交测试任务")
+            logger.info("  python burst_example.py fast     # 启动快速 Burst Worker")
+            logger.info("  python burst_example.py patient  # 启动耐心 Burst Worker")
+    else:
+        # 提交测试任务
+        logger.info("启动任务提交模式...")
+        asyncio.run(submit_test_tasks()) 
