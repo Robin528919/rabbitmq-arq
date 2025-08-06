@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import signal
@@ -18,7 +17,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from functools import partial
 from signal import Signals
-from typing import Any, Union, Type
+from typing import Any
 
 from aio_pika import connect_robust, IncomingMessage, Message
 
@@ -32,34 +31,34 @@ logger = logging.getLogger('rabbitmq-arq.worker')
 # 错误分类定义
 class ErrorClassification:
     """错误分类配置，用于智能重试策略"""
-    
+
     # 不可重试的错误类型（立即失败）
     NON_RETRIABLE_ERRORS = (
-        TypeError,          # 函数签名错误、参数类型错误
-        ValueError,         # 参数值错误  
-        AttributeError,     # 属性错误
-        ImportError,        # 导入错误
-        ModuleNotFoundError, # 模块未找到
-        SyntaxError,        # 语法错误
-        NameError,          # 名称错误
-        KeyError,           # 字典键错误（配置相关）
-        MaxRetriesExceeded, # 已达到最大重试次数
+        TypeError,  # 函数签名错误、参数类型错误
+        ValueError,  # 参数值错误
+        AttributeError,  # 属性错误
+        ImportError,  # 导入错误
+        ModuleNotFoundError,  # 模块未找到
+        SyntaxError,  # 语法错误
+        NameError,  # 名称错误
+        KeyError,  # 字典键错误（配置相关）
+        MaxRetriesExceeded,  # 已达到最大重试次数
     )
-    
+
     # 可重试的错误类型
     RETRIABLE_ERRORS = (
-        ConnectionError,    # 网络连接错误
-        TimeoutError,      # 超时错误
-        OSError,           # 操作系统错误
-        IOError,           # IO错误
-        Retry,             # 显式重试请求
+        ConnectionError,  # 网络连接错误
+        TimeoutError,  # 超时错误
+        OSError,  # 操作系统错误
+        IOError,  # IO错误
+        Retry,  # 显式重试请求
     )
-    
+
     # 特殊处理：业务异常（需要检查重试次数）
     BUSINESS_ERRORS = (
-        Exception,         # 一般业务异常，需要根据重试次数决定
+        Exception,  # 一般业务异常，需要根据重试次数决定
     )
-    
+
     @classmethod
     def is_retriable_error(cls, error: Exception) -> bool:
         """
@@ -74,18 +73,18 @@ class ErrorClassification:
         # 显式不可重试的错误
         if isinstance(error, cls.NON_RETRIABLE_ERRORS):
             return False
-            
+
         # 显式可重试的错误  
         if isinstance(error, cls.RETRIABLE_ERRORS):
             return True
-            
+
         # 业务异常：需要进一步检查重试次数
         if isinstance(error, cls.BUSINESS_ERRORS):
             return True
-            
+
         # 其他未知异常：默认不可重试（更保守的策略）
         return False
-    
+
     @classmethod
     def get_error_category(cls, error: Exception) -> str:
         """
@@ -100,7 +99,7 @@ class ErrorClassification:
         if isinstance(error, cls.NON_RETRIABLE_ERRORS):
             return "non_retriable"
         elif isinstance(error, cls.RETRIABLE_ERRORS):
-            return "retriable" 
+            return "retriable"
         elif isinstance(error, cls.BUSINESS_ERRORS):
             return "business_retriable"
         else:
@@ -142,55 +141,88 @@ class WorkerUtils:
         """
         sig = Signals(signum)
 
+        # 记录当前状态
+        running_tasks = len(self.tasks)
+        logger.info(
+            f'🛑 收到 {sig.name} 信号 - 统计信息: ✅完成:{self.jobs_complete} ❌失败:{self.jobs_failed} '
+            f'🔄重试:{self.jobs_retried} ⏳运行中:{running_tasks}'
+        )
+
         if self._burst_mode:
-            logger.info(f'🛑 Burst 模式收到信号 {sig.name}，立即停止')
+            logger.info(f'🛑 Burst 模式收到信号 {sig.name}，开始优雅关闭')
             self.allow_pick_jobs = False
             self._burst_should_exit = True
             # 在 burst 模式下，可以选择立即退出或等待任务完成
-            if self.worker_settings.burst_wait_for_tasks:
-                logger.info(f'⏳ 等待 {len(self.tasks)} 个正在执行的任务完成...')
+            if self.worker_settings.burst_wait_for_tasks and running_tasks > 0:
+                logger.info(f'⏳ Burst 模式：等待 {running_tasks} 个正在执行的任务完成...')
                 self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
             else:
-                logger.info('🚫 不等待任务完成，立即退出')
-                # 取消所有任务
-                for t in self.tasks.values():
-                    if not t.done():
-                        t.cancel()
+                if running_tasks > 0:
+                    logger.info(f'🚫 Burst 模式：不等待任务完成，取消 {running_tasks} 个正在执行的任务')
+                    # 取消所有任务
+                    for t in self.tasks.values():
+                        if not t.done():
+                            t.cancel()
+                else:
+                    logger.info('✅ Burst 模式：没有正在执行的任务，立即退出')
                 self.main_task and self.main_task.cancel()
         else:
-            logger.info('正在优雅关闭，设置 allow_pick_jobs 为 False')
+            logger.info(f'🔄 常规模式：开始优雅关闭，停止接收新任务')
             self.allow_pick_jobs = False
-            logger.info(
-                '收到信号 %s ◆ %d 个任务完成 ◆ %d 个失败 ◆ %d 个重试 ◆ %d 个待完成',
-                sig.name,
-                self.jobs_complete,
-                self.jobs_failed,
-                self.jobs_retried,
-                len(self.tasks),
-            )
-            self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+            if running_tasks > 0:
+                logger.info(
+                    f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{self.worker_settings.wait_for_job_completion_on_signal_second}秒）')
+                self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+            else:
+                logger.info('✅ 没有正在执行的任务，可以立即关闭')
+                self.shutdown_event.set()
 
     async def _wait_for_tasks_to_complete(self, signum: Signals) -> None:
         """
         等待任务完成，直到达到 `wait_for_job_completion_on_signal_second`。
         """
-        with contextlib.suppress(asyncio.TimeoutError):
+        start_time = datetime.now()
+        initial_tasks = len(self.tasks)
+        timeout = self._job_completion_wait
+
+        logger.info(f'⏳ 开始等待任务完成：初始任务数 {initial_tasks}，超时时间 {timeout} 秒')
+
+        try:
             await asyncio.wait_for(
                 self._sleep_until_tasks_complete(),
-                self._job_completion_wait,
+                timeout,
             )
+            elapsed = (datetime.now() - start_time).total_seconds()
+            logger.info(f'✅ 所有任务已完成，用时 {elapsed:.2f} 秒')
+        except asyncio.TimeoutError:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            remaining_tasks = len(self.tasks)
+            completed_tasks = initial_tasks - remaining_tasks
+
+            logger.warning(
+                f'⏰ 等待超时（{elapsed:.2f}秒）：{completed_tasks} 个任务已完成，'
+                f'{remaining_tasks} 个任务将被强制取消'
+            )
+
+        # 显示最终状态统计
+        cancelled_count = sum(not t.done() for t in self.tasks.values())
         logger.info(
-            '关闭信号 %s，等待完成 ◆ %d 个任务完成 ◆ %d 个失败 ◆ %d 个重试 ◆ %d 个正在取消',
-            signum.name,
-            self.jobs_complete,
-            self.jobs_failed,
-            self.jobs_retried,
-            sum(not t.done() for t in self.tasks.values()),
+            f'🔚 关闭信号 {signum.name} 处理完成 - 统计信息: ✅完成:{self.jobs_complete} '
+            f'❌失败:{self.jobs_failed} 🔄重试:{self.jobs_retried} 🚫取消:{cancelled_count}'
         )
+
+        # 取消剩余的任务
         for t in self.tasks.values():
             if not t.done():
                 t.cancel()
+
+        # 设置关闭事件
+        self.shutdown_event.set()
+
+        # 取消主任务
         self.main_task and self.main_task.cancel()
+
+        # 执行关闭回调
         self.on_stop and self.on_stop(signum)
 
     async def _sleep_until_tasks_complete(self) -> None:
@@ -205,6 +237,53 @@ class WorkerUtils:
             self.loop.add_signal_handler(signum, partial(handler, signum))
         except NotImplementedError:  # pragma: no cover
             logger.debug('Windows 不支持向事件循环添加信号处理器')
+
+    async def graceful_shutdown(self, reason: str = "用户请求") -> None:
+        """
+        优雅关闭 Worker
+        
+        Args:
+            reason: 关闭原因，用于日志记录
+        """
+        running_tasks = len(self.tasks)
+        logger.info(
+            f'🔄 开始优雅关闭 Worker - 原因: {reason}'
+            f' - 统计信息: ✅完成:{self.jobs_complete} ❌失败:{self.jobs_failed} '
+            f'🔄重试:{self.jobs_retried} ⏳运行中:{running_tasks}'
+        )
+
+        # 停止接收新任务
+        self.allow_pick_jobs = False
+
+        # 如果有正在运行的任务，等待它们完成
+        if running_tasks > 0:
+            timeout = getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', 30)
+            logger.info(f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{timeout}秒）')
+
+            try:
+                await asyncio.wait_for(
+                    self._sleep_until_tasks_complete(),
+                    timeout=timeout
+                )
+                logger.info('✅ 所有任务已完成，开始关闭连接')
+            except asyncio.TimeoutError:
+                remaining = len(self.tasks)
+                logger.warning(f'⏰ 等待超时，强制取消 {remaining} 个未完成的任务')
+                for t in self.tasks.values():
+                    if not t.done():
+                        t.cancel()
+
+        # 关闭连接
+        try:
+            if self.connection and not self.connection.is_closed:
+                await self.connection.close()
+                logger.info('🔌 RabbitMQ 连接已关闭')
+        except Exception as e:
+            logger.error(f'❌ 关闭连接时发生错误: {e}')
+
+        # 设置关闭事件
+        self.shutdown_event.set()
+        logger.info('✅ Worker 优雅关闭完成')
 
 
 class Worker(WorkerUtils):
@@ -354,16 +433,16 @@ class Worker(WorkerUtils):
 
             except Exception as e:
                 logger.error(f"处理消息时发生错误: {e}\n{traceback.format_exc()}")
-                
+
                 # 智能错误处理
                 error_category = ErrorClassification.get_error_category(e)
-                
+
                 # 1. 不可重试的错误：立即发送到死信队列
                 if not ErrorClassification.is_retriable_error(e):
                     logger.error(f"任务 {job_id} 遇到不可重试错误 ({error_category}): {type(e).__name__}: {e}")
                     await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                     return
-                
+
                 # 2. 业务异常：检查重试次数
                 if error_category == "business_retriable":
                     # 业务异常需要检查重试次数
@@ -371,13 +450,13 @@ class Worker(WorkerUtils):
                         logger.error(f"任务 {job_id} 业务异常已达到最大重试次数 {self.worker_settings.max_retries}: {type(e).__name__}: {e}")
                         await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                         return
-                
+
                 # 3. 可重试的错误：统一重试计数逻辑
                 # retry_count 从消息头获取，表示已重试次数
                 # job_try 表示即将执行的次数（retry_count + 1）
                 if job_id and job:
                     job.job_try = retry_count + 1
-                
+
                 # 最终检查重试次数（双重保险）
                 if job.job_try >= self.worker_settings.max_retries:
                     logger.error(f"任务 {job_id} 已达到最大重试次数 {self.worker_settings.max_retries}")
@@ -390,7 +469,8 @@ class Worker(WorkerUtils):
                 # 发送到延迟队列进行重试
                 if job_id and job:
                     await self._send_to_delay_queue(job, delay_seconds)
-                    logger.info(f"任务 {job_id} 第 {retry_count + 1} 次重试，延迟 {delay_seconds:.1f} 秒 (错误类型: {type(e).__name__}, 分类: {error_category})")
+                    logger.info(
+                        f"任务 {job_id} 第 {retry_count + 1} 次重试，延迟 {delay_seconds:.1f} 秒 (错误类型: {type(e).__name__}, 分类: {error_category})")
 
             finally:
                 # 从任务列表中移除
@@ -591,9 +671,9 @@ class Worker(WorkerUtils):
             'x-failed-at': datetime.now().isoformat(),
             'x-job-id': job_id or 'unknown'
         })
-        
+
         logger.error(f"任务 {job_id} 发送到死信队列: {type(error).__name__}: {error}")
-        
+
         await self.dlq_channel.default_exchange.publish(
             Message(body=body, headers=error_headers),
             routing_key=self.rabbitmq_dlq
@@ -612,7 +692,7 @@ class Worker(WorkerUtils):
 
         # 序列化任务
         message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
-        
+
         # 统一重试计数逻辑：x-retry-count = job_try - 1
         # job_try 表示执行次数（从1开始），retry_count 表示重试次数（从0开始）
         retry_count = job.job_try - 1
