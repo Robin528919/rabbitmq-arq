@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from typing import Any, Protocol
-
+from .models import JobContext
 
 class WorkerCoroutine(Protocol):
     """
@@ -19,7 +19,7 @@ class WorkerCoroutine(Protocol):
     """
     __qualname__: str
 
-    async def __call__(self, ctx: dict[Any, Any], *args: Any, **kwargs: Any) -> Any:
+    async def __call__(self, ctx: JobContext, *args: Any, **kwargs: Any) -> Any:
         """
         执行任务
         

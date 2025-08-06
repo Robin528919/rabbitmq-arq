@@ -24,6 +24,7 @@ from aio_pika import connect_robust, IncomingMessage, Message
 from .connections import WorkerSettings
 from .exceptions import Retry, JobTimeout, MaxRetriesExceeded
 from .models import JobModel, JobContext, JobStatus, WorkerInfo
+from .protocols import WorkerCoroutine
 
 logger = logging.getLogger('rabbitmq-arq.worker')
 
@@ -108,30 +109,40 @@ class ErrorClassification:
 
 class WorkerUtils:
     """
-    消费者工具类
+    消费者工具类 - 基础属性和信号处理
     """
 
-    def __init__(self):
+    def __init__(self, worker_settings=None):
         self.loop = asyncio.get_event_loop()
         self.allow_pick_jobs = True
         self.tasks: dict[str, asyncio.Task] = {}
         self.main_task: asyncio.Task | None = None
         self.on_stop: Callable | None = None
 
+        # 基础配置 - 如果有worker_settings就使用，否则创建临时属性
+        self.worker_settings = worker_settings
+        self.shutdown_event = asyncio.Event()
+
         # 任务统计
         self.jobs_complete = 0
         self.jobs_failed = 0
         self.jobs_retried = 0
 
-        # Worker 信息
+        # Worker 基础信息 - 可能会被子类覆盖
         self.worker_id = uuid.uuid4().hex
         self.worker_info = WorkerInfo(
             worker_id=self.worker_id,
             start_time=datetime.now()
         )
 
-        self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
-        self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
+        # 信号处理相关属性
+        self._job_completion_wait = 30  # 默认等待时间30秒
+
+        # 子类可能需要的burst模式相关属性的默认值
+        self._burst_mode = False
+
+        # 设置信号处理器的标志，子类可以控制是否启用
+        self._signal_handlers_enabled = False
 
     def handle_sig_wait_for_completion(self, signum: Signals) -> None:
         """
@@ -183,7 +194,9 @@ class WorkerUtils:
         """
         start_time = datetime.now()
         initial_tasks = len(self.tasks)
-        timeout = self._job_completion_wait
+        # 使用worker_settings中的配置，如果没有则使用默认值
+        timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
+                   if self.worker_settings else None) or self._job_completion_wait
 
         logger.info(f'⏳ 开始等待任务完成：初始任务数 {initial_tasks}，超时时间 {timeout} 秒')
 
@@ -257,7 +270,9 @@ class WorkerUtils:
 
         # 如果有正在运行的任务，等待它们完成
         if running_tasks > 0:
-            timeout = getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', 30)
+            # 统一的超时时间获取逻辑
+            timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
+                       if self.worker_settings else None) or 30
             logger.info(f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{timeout}秒）')
 
             try:
@@ -300,16 +315,17 @@ class Worker(WorkerUtils):
         Args:
             worker_settings: Worker 配置对象，包含所有必要的配置参数
         """
-        super().__init__()
-        self.worker_settings = worker_settings
+        # 调用父类初始化，传递worker_settings
+        super().__init__(worker_settings)
+
+        # Worker特有的属性
         self.functions = {fn.__name__: fn for fn in worker_settings.functions}
         self.connection = None
         self.channel = None
         self.dlq_channel = None
         self.consuming = False
-        self.shutdown_event = asyncio.Event()
-        self.tasks_running = set()
-        self.tasks = dict()  # 兼容性别名
+
+        # 统一使用父类的 self.tasks 字典进行任务管理，不再需要 tasks_running
 
         # 生命周期钩子
         self.on_startup = worker_settings.on_startup
@@ -317,35 +333,26 @@ class Worker(WorkerUtils):
         self.on_job_start = worker_settings.on_job_start
         self.on_job_end = worker_settings.on_job_end
 
-        # 上下文和统计信息
+        # 上下文
         self.ctx = {}
-        self.jobs_complete = 0
-        self.jobs_failed = 0
-        self.jobs_retried = 0
-        self.allow_pick_jobs = True
 
         # 兼容性属性
         self.functions_map = self.functions  # 兼容性别名
         self.after_job_end = None  # 兼容性钩子
 
-        # Worker 信息
+        # 覆盖父类的worker_id，使用配置中的名称
         self.worker_id = worker_settings.worker_name or f"worker_{uuid.uuid4().hex[:8]}"
         self.worker_info = WorkerInfo(
             worker_id=self.worker_id,
             start_time=datetime.now()
         )
 
-        # 简单的统计计数器
-        self._stats = {
-            'jobs_complete': 0,
-            'jobs_failed': 0,
-            'jobs_retried': 0,
-            'start_time': None
-        }
-
-        # Burst 模式相关  
+        # Burst 模式相关（覆盖父类默认值）
         self._burst_mode = worker_settings.burst_mode
         self._burst_should_exit = False
+        self._burst_start_time: datetime | None = None
+        self._burst_check_task: asyncio.Task | None = None
+        self._health_check_task: asyncio.Task | None = None
 
         # 延迟任务机制配置（初始化时暂不设置，在连接后按需设置）
         self._use_delayed_exchange = False
@@ -353,7 +360,17 @@ class Worker(WorkerUtils):
         self._delay_queue_name = None
         self._delay_mechanism_detected = False
 
-    async def _init(self):
+        # 现在子类属性都初始化完成了，可以设置信号处理器
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self) -> None:
+        """设置信号处理器"""
+        if not self._signal_handlers_enabled:
+            self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
+            self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
+            self._signal_handlers_enabled = True
+
+    async def _init(self) -> None:
         """初始化连接"""
         if not self.worker_settings.rabbitmq_settings:
             raise ValueError("必须提供 RabbitMQ 连接配置")
@@ -385,7 +402,7 @@ class Worker(WorkerUtils):
 
         logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}")
 
-    async def on_message(self, message: IncomingMessage):
+    async def on_message(self, message: IncomingMessage) -> None:
         """
         处理 RabbitMQ 消息的回调方法，包含重试和失败转死信队列逻辑。
         """
@@ -510,7 +527,7 @@ class Worker(WorkerUtils):
                 await self.on_job_start(hook_ctx)
 
             # 获取要执行的函数
-            func = self.functions_map.get(job.function)
+            func = self.functions_map.get(job.function)  # type: WorkerCoroutine
             if not func:
                 raise ValueError(f"未找到函数: {job.function}")
 
@@ -624,7 +641,7 @@ class Worker(WorkerUtils):
             self.worker_info.jobs_retried = self.jobs_retried
             self.worker_info.jobs_ongoing = len(self.tasks)
 
-    async def _enqueue_job_retry(self, job: JobModel, defer_seconds: float):
+    async def _enqueue_job_retry(self, job: JobModel, defer_seconds: float) -> None:
         """
         重新入队任务进行重试，使用延迟队列
         
@@ -643,7 +660,7 @@ class Worker(WorkerUtils):
 
         logger.info(f"任务 {job.job_id} 已发送到延迟队列进行重试，将在 {defer_seconds:.1f} 秒后执行 (重试次数: {retry_count})")
 
-    async def _send_to_dlq(self, body: bytes, headers: dict[str, Any]):
+    async def _send_to_dlq(self, body: bytes, headers: dict[str, Any]) -> None:
         """
         将消息发送到死信队列
         """
@@ -652,7 +669,7 @@ class Worker(WorkerUtils):
             routing_key=self.rabbitmq_dlq
         )
 
-    async def _send_to_dlq_with_error(self, body: bytes, headers: dict[str, Any], error: Exception, job_id: str = None):
+    async def _send_to_dlq_with_error(self, body: bytes, headers: dict[str, Any], error: Exception, job_id: str | None = None) -> None:
         """
         将消息连同错误信息发送到死信队列
         
@@ -679,7 +696,7 @@ class Worker(WorkerUtils):
             routing_key=self.rabbitmq_dlq
         )
 
-    async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float):
+    async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float) -> None:
         """
         将任务发送到延迟队列，自动选择最佳延迟机制
         
@@ -734,7 +751,7 @@ class Worker(WorkerUtils):
 
             logger.info(f"任务 {job.job_id} 已通过 TTL 队列发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {retry_count})")
 
-    async def _setup_delay_mechanism(self):
+    async def _setup_delay_mechanism(self) -> None:
         """
         检测并设置延迟机制：优先使用延迟插件，其次使用 TTL + DLX
         与 Client 的检测逻辑保持一致
@@ -796,14 +813,14 @@ class Worker(WorkerUtils):
                 # 重新抛出异常，让调用者处理
                 raise
 
-    async def _health_check_loop(self):
+    async def _health_check_loop(self) -> None:
         """
         健康检查循环
         """
         while self.allow_pick_jobs:
             try:
                 self.worker_info.last_health_check = datetime.now()
-                # TODO: 可以在这里添加更多健康检查逻辑，比如写入 Redis
+                # 健康检查：可以扩展添加更多检查逻辑（如 Redis 心跳等）
                 logger.debug(f"健康检查 - Worker {self.worker_id} 正常运行")
                 await asyncio.sleep(self.worker_settings.health_check_interval)
             except asyncio.CancelledError:
@@ -862,7 +879,7 @@ class Worker(WorkerUtils):
         logger.debug(f"Burst 检查: 队列={queue_count}条消息, 运行中={running_tasks}个任务")
         return False
 
-    async def _burst_monitor_loop(self):
+    async def _burst_monitor_loop(self) -> None:
         """
         Burst 模式监控循环
         """
@@ -898,7 +915,7 @@ class Worker(WorkerUtils):
                 logger.error(f"Burst 监控出错: {e}")
                 await asyncio.sleep(1)
 
-    async def consume(self):
+    async def consume(self) -> None:
         """
         开始消费消息
         """
@@ -939,7 +956,7 @@ class Worker(WorkerUtils):
             if self._burst_check_task:
                 self._burst_check_task.cancel()
 
-    async def main(self):
+    async def main(self) -> None:
         """
         Worker 主函数
         """
