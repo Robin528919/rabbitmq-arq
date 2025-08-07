@@ -168,6 +168,10 @@ class WorkerUtils:
             logger.info(f'🛑 Burst 模式收到信号 {sig.name}，开始优雅关闭')
             self.allow_pick_jobs = False
             self._burst_should_exit = True
+            
+            # 立即取消消费者，停止接收新消息
+            asyncio.create_task(self._cancel_consumer())
+            
             # 在 burst 模式下，可以选择立即退出或等待任务完成
             if self.worker_settings.burst_wait_for_tasks and running_tasks > 0:
                 logger.info(f'⏳ Burst 模式：等待 {running_tasks} 个正在执行的任务完成...')
@@ -185,6 +189,10 @@ class WorkerUtils:
         else:
             logger.info(f'🔄 常规模式：开始优雅关闭，停止接收新任务')
             self.allow_pick_jobs = False
+            
+            # 立即取消消费者，停止接收新消息
+            asyncio.create_task(self._cancel_consumer())
+            
             if running_tasks > 0:
                 # 获取等待超时时间，如果没有配置则使用默认值
                 timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
@@ -267,6 +275,29 @@ class WorkerUtils:
         except RuntimeError as e:
             logger.warning(f"⚠️ 无法设置 {signum.name} 信号处理器: {e}")
 
+    async def _cancel_consumer(self) -> None:
+        """
+        取消消费者，停止接收新消息
+        """
+        if hasattr(self, '_consumer_tag') and self._consumer_tag and hasattr(self, '_queue') and self._queue:
+            if not self.channel or self.channel.is_closed:
+                logger.warning("⚠️ 消息通道已关闭，无法取消消费者")
+                return
+                
+            try:
+                logger.info("🛑 立即停止消息消费者，阻止接收新消息")
+                await self._safe_operation_with_timeout(
+                    self._queue.cancel(self._consumer_tag),
+                    "取消消息消费者",
+                    timeout=5.0
+                )
+                logger.info("✅ 消息消费者已停止")
+                self._consumer_tag = None
+            except Exception as e:
+                logger.warning(f"⚠️ 取消消费者时出现错误: {e}")
+        else:
+            logger.debug("🔍 消费者未启动或已取消")
+
     async def _safe_operation_with_timeout(self, operation, operation_name: str, timeout: float = 30.0):
         """
         安全执行操作，带超时保护和异常处理
@@ -302,6 +333,9 @@ class WorkerUtils:
 
         # 停止接收新任务
         self.allow_pick_jobs = False
+        
+        # 立即取消消费者，停止接收新消息
+        await self._cancel_consumer()
 
         # 如果有正在运行的任务，等待它们完成
         if running_tasks > 0:
@@ -390,6 +424,10 @@ class Worker(WorkerUtils):
         self._delayed_exchange_name = None
         self._delay_queue_name = None
         self._delay_mechanism_detected = False
+
+        # 消费者标签管理 - 用于取消消费者
+        self._consumer_tag: str | None = None
+        self._queue = None
 
         # 信号处理器将在 main() 方法中设置，因为此时事件循环还没有运行
 
@@ -964,6 +1002,7 @@ class Worker(WorkerUtils):
         """
         # 声明队列（Burst 和常规模式都需要）
         queue = await self.channel.declare_queue(self.rabbitmq_queue, durable=True)
+        self._queue = queue  # 保存队列引用
 
         if self._burst_mode:
             # Burst 模式：检查队列是否为空
@@ -984,6 +1023,7 @@ class Worker(WorkerUtils):
 
         # 开始消费消息（Burst 和常规模式都需要）
         consumer_tag = await queue.consume(lambda message: asyncio.create_task(self.on_message(message)))
+        self._consumer_tag = consumer_tag  # 保存消费者标签
         logger.debug(f"🔧 消息消费器已启动，consumer_tag: {consumer_tag}")
 
         try:
@@ -998,15 +1038,16 @@ class Worker(WorkerUtils):
             raise
         finally:
             # 关键改进：停止消息消费器
-            if consumer_tag and not self.channel.is_closed:
+            if self._consumer_tag and not self.channel.is_closed:
                 try:
                     logger.info("🔧 正在停止消息消费器...")
                     await self._safe_operation_with_timeout(
-                        queue.cancel(consumer_tag),
+                        queue.cancel(self._consumer_tag),
                         "消息消费器停止",
                         timeout=5.0
                     )
                     logger.info("✅ 消息消费器已停止")
+                    self._consumer_tag = None
                 except Exception as e:
                     logger.warning(f"⚠️ 停止消费器时出现错误: {e}")
 
