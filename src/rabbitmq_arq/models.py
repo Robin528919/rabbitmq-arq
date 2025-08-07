@@ -35,14 +35,14 @@ class JobModel(BaseModel):
     kwargs: dict[str, Any] = Field(default_factory=dict, description="关键字参数")
     job_try: int = Field(default=1, description="任务尝试次数")
     enqueue_time: datetime = Field(default_factory=datetime.now, description="入队时间")
-    start_time: datetime | None = Field(None, description="开始执行时间")
-    end_time: datetime | None = Field(None, description="结束时间")
+    start_time: datetime | None = Field(default=None, description="开始执行时间")
+    end_time: datetime | None = Field(default=None, description="结束时间")
     status: JobStatus = Field(default=JobStatus.QUEUED, description="任务状态")
-    result: Any | None = Field(None, description="任务结果")
-    error: str | None = Field(None, description="错误信息")
+    result: Any | None = Field(default=None, description="任务结果")
+    error: str | None = Field(default=None, description="错误信息")
     queue_name: str = Field(..., description="队列名称")
-    defer_until: datetime | None = Field(None, description="延迟执行时间")
-    expires: datetime | None = Field(None, description="过期时间")
+    defer_until: datetime | None = Field(default=None, description="延迟执行时间")
+    expires: datetime | None = Field(default=None, description="过期时间")
     
     # Pydantic V2 配置 - 使用 ConfigDict 替代 Config 类
     model_config = ConfigDict(
