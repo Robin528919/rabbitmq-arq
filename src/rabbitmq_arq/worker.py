@@ -140,6 +140,12 @@ class WorkerUtils:
 
         # 子类可能需要的burst模式相关属性的默认值
         self._burst_mode = False
+        self._burst_should_exit = False
+
+        # 连接相关属性 - 子类会覆盖这些默认值
+        self.connection: Any = None  # aio_pika.Connection
+        self.channel: Any = None     # aio_pika.Channel  
+        self.dlq_channel: Any = None # aio_pika.Channel
 
         # 设置信号处理器的标志，子类可以控制是否启用
         self._signal_handlers_enabled = False
@@ -187,6 +193,9 @@ class WorkerUtils:
             else:
                 logger.info('✅ 没有正在执行的任务，可以立即关闭')
                 self.shutdown_event.set()
+                # 取消主任务以立即退出
+                if self.main_task and not self.main_task.done():
+                    self.main_task.cancel()
 
     async def _wait_for_tasks_to_complete(self, signum: Signals) -> None:
         """
@@ -320,9 +329,6 @@ class Worker(WorkerUtils):
 
         # Worker特有的属性
         self.functions = {fn.__name__: fn for fn in worker_settings.functions}
-        self.connection = None
-        self.channel = None
-        self.dlq_channel = None
         self.consuming = False
 
         # 统一使用父类的 self.tasks 字典进行任务管理，不再需要 tasks_running
@@ -349,7 +355,6 @@ class Worker(WorkerUtils):
 
         # Burst 模式相关（覆盖父类默认值）
         self._burst_mode = worker_settings.burst_mode
-        self._burst_should_exit = False
         self._burst_start_time: datetime | None = None
         self._burst_check_task: asyncio.Task | None = None
         self._health_check_task: asyncio.Task | None = None
@@ -366,9 +371,12 @@ class Worker(WorkerUtils):
     def _setup_signal_handlers(self) -> None:
         """设置信号处理器"""
         if not self._signal_handlers_enabled:
+            logger.info("🔧 正在设置信号处理器...")
             self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
             self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
             self._signal_handlers_enabled = True
+            logger.info("✅ 信号处理器设置完成 (SIGINT, SIGTERM)")
+            logger.info("💡 提示: 请使用 Ctrl+C 或 kill -TERM <pid> 优雅停止 Worker")
 
     async def _init(self) -> None:
         """初始化连接"""
@@ -943,7 +951,9 @@ class Worker(WorkerUtils):
         await queue.consume(lambda message: asyncio.create_task(self.on_message(message)))
 
         try:
-            await asyncio.Future()
+            # 等待关闭信号或被取消
+            await self.shutdown_event.wait()
+            logger.info("收到关闭信号，准备退出消费循环")
         except asyncio.CancelledError:
             if self._burst_mode:
                 logger.info("🏁 Burst 模式消费者退出")
@@ -984,7 +994,7 @@ class Worker(WorkerUtils):
             await self.consume()
 
         except KeyboardInterrupt:
-            logger.info("收到键盘中断信号")
+            logger.info("🛑 收到键盘中断信号 (SIGINT)，正在优雅关闭...")
         except asyncio.CancelledError:
             if self._burst_mode:
                 # 计算运行时间和统计信息
@@ -994,9 +1004,18 @@ class Worker(WorkerUtils):
                             f"失败 {self.jobs_failed} 个, "
                             f"重试 {self.jobs_retried} 个")
             else:
-                logger.info("Worker 被取消")
+                logger.info("🛑 Worker 收到取消信号，正在优雅关闭...")
+        except SystemExit as e:
+            logger.info(f"🛑 系统退出信号: {e}")
         except Exception as e:
-            logger.error(f"Worker 运行出错: {e}\n{traceback.format_exc()}")
+            logger.error(f"❌ Worker 运行出错: {e}")
+            logger.error(f"详细错误信息:\n{traceback.format_exc()}")
+            # 如果是连接错误，给出建议
+            if "connection" in str(e).lower() or "rabbitmq" in str(e).lower():
+                logger.error("💡 请检查:")
+                logger.error("   1. RabbitMQ 服务是否正在运行")
+                logger.error("   2. 连接配置是否正确")
+                logger.error("   3. 网络连接是否正常")
             raise
         finally:
             # 等待最后的任务完成（如果在 burst 模式且配置了等待）
