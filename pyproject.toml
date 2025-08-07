@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rabbitmq-arq"
+name = "rabbitmq_arq"
 version = "0.1.1"
 description = "一个基于RabbitMQ的任务队列库，提供类似arq的简洁API"
 readme = "README.md"
@@ -57,7 +57,7 @@ Documentation = "https://rabbitmq-arq.readthedocs.io"
 "Bug Tracker" = "https://github.com/your-username/rabbitmq-arq/issues"
 
 [project.scripts]
-rabbitmq-arq = "rabbitmq_arq.cli:main"
+rabbitmq_arq = "rabbitmq_arq.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

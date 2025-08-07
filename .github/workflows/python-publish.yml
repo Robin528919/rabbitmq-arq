@@ -1,10 +1,8 @@
-# This workflow will upload a Python Package to PyPI when a release is created
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
+# 当创建发布版本时，此工作流将上传 Python 包到 PyPI
+# 更多信息请参见: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python#publishing-to-package-registries
 
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
+# 此工作流使用的操作未经 GitHub 认证
+# 它们由第三方提供，受单独的服务条款、隐私政策和支持文档约束
 
 name: Upload Python Package
 
@@ -28,7 +26,7 @@ jobs:
 
       - name: Build release distributions
         run: |
-          # NOTE: put your own distribution build steps here.
+          # 注意: 在此处放置您自己的分发构建步骤
           python -m pip install build
           python -m build
 
@@ -43,18 +41,18 @@ jobs:
     needs:
       - release-build
     permissions:
-      # IMPORTANT: this permission is mandatory for trusted publishing
+      # 重要: 此权限对于可信发布是必需的
       id-token: write
 
-    # Dedicated environments with protections for publishing are strongly recommended.
-    # For more information, see: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#deployment-protection-rules
+    # 强烈建议使用具有发布保护功能的专用环境
+    # 更多信息请参见: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment#deployment-protection-rules
     environment:
       name: pypi
-      # OPTIONAL: uncomment and update to include your PyPI project URL in the deployment status:
+      # 可选: 取消注释并更新以在部署状态中包含您的 PyPI 项目 URL:
       # url: https://pypi.org/p/YOURPROJECT
       #
-      # ALTERNATIVE: if your GitHub Release name is the PyPI project version string
-      # ALTERNATIVE: exactly, uncomment the following line instead:
+      # 替代方案: 如果您的 GitHub Release 名称恰好是 PyPI 项目版本字符串
+      # 替代方案: 请取消注释以下行:
       # url: https://pypi.org/project/YOURPROJECT/${{ github.event.release.name }}
 
     steps:
