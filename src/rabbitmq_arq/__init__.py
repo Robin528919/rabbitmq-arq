@@ -17,7 +17,7 @@ from .exceptions import (
     MaxRetriesExceeded,
     SerializationError,
     ConfigurationError,
-    ConnectionError as RabbitMQConnectionError,
+    RabbitMQConnectionError,
     RabbitMQArqException,
     JobException
 )

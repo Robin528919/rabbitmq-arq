@@ -22,7 +22,7 @@ from typing import Any
 from aio_pika import connect_robust, IncomingMessage, Message
 
 from .connections import WorkerSettings
-from .exceptions import Retry, JobTimeout, MaxRetriesExceeded
+from .exceptions import Retry, JobTimeout, MaxRetriesExceeded, RabbitMQConnectionError
 from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine
 
@@ -48,7 +48,7 @@ class ErrorClassification:
 
     # 可重试的错误类型
     RETRIABLE_ERRORS = (
-        ConnectionError,  # 网络连接错误
+        RabbitMQConnectionError,  # RabbitMQ 连接错误
         TimeoutError,  # 超时错误
         OSError,  # 操作系统错误
         IOError,  # IO错误
@@ -550,7 +550,7 @@ class Worker(WorkerUtils):
             else:
                 # 同步函数在线程池中执行
                 result = await asyncio.wait_for(
-                    self.loop.run_in_executor(None, func, job_ctx, *job.args, **job.kwargs),
+                    self.loop.run_in_executor(None, partial(func, job_ctx, *job.args, **job.kwargs)),
                     timeout=self.worker_settings.job_timeout
                 )
 

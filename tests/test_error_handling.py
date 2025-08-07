@@ -31,7 +31,7 @@ import pytest_asyncio
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rabbitmq_arq import RabbitMQClient, Worker, RabbitMQSettings, WorkerSettings, default_queue_name
-from rabbitmq_arq.exceptions import Retry, MaxRetriesExceeded
+from rabbitmq_arq.exceptions import Retry, MaxRetriesExceeded, RabbitMQConnectionError
 
 
 # ==================== 错误任务函数定义 ====================
@@ -78,7 +78,7 @@ async def task_connection_error(ctx, attempt_count: int):
     print(f"🟡 ConnectionError任务开始: 尝试 {attempt_count}")
 
     # 模拟网络连接失败
-    raise ConnectionError(f"网络连接失败 - 尝试 {attempt_count}")
+    raise RabbitMQConnectionError(f"网络连接失败 - 尝试 {attempt_count}")
 
 
 async def task_timeout_error(ctx, timeout_seconds: int):
@@ -134,7 +134,7 @@ async def task_random_errors(ctx, error_type: str):
         none_obj = None
         none_obj.some_attr
     elif error_type == "ConnectionError":
-        raise ConnectionError("模拟网络错误")
+        raise RabbitMQConnectionError("模拟网络错误")
     elif error_type == "TimeoutError":
         raise TimeoutError("模拟超时")
     elif error_type == "Exception":
@@ -626,7 +626,7 @@ class TestErrorClassification:
         from rabbitmq_arq.worker import ErrorClassification
 
         retriable_errors = [
-            ConnectionError("test"),
+            RabbitMQConnectionError("test"),
             TimeoutError("test"),
             OSError("test"),
             IOError("test"),

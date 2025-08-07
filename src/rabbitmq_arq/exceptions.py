@@ -153,16 +153,16 @@ class ConfigurationError(RabbitMQArqException):
         self.config_key = config_key
 
 
-class ConnectionError(RabbitMQArqException):
-    """连接错误"""
+class RabbitMQConnectionError(RabbitMQArqException):
+    """RabbitMQ 连接错误"""
     
     def __init__(self, message: str | None = None, url: str | None = None) -> None:
         if message and url:
-            full_message = f"连接错误 ({url}): {message}"
+            full_message = f"RabbitMQ 连接错误 ({url}): {message}"
         elif message:
-            full_message = f"连接错误: {message}"
+            full_message = f"RabbitMQ 连接错误: {message}"
         else:
-            full_message = "连接错误"
+            full_message = "RabbitMQ 连接错误"
         
         super().__init__(full_message)
         self.url = url 
