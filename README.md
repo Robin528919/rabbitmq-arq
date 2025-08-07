@@ -165,26 +165,6 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## 从现有系统迁移
-
-如果你正在使用自定义的 Consumer 类，可以轻松迁移到 rabbitmq-arq：
-
-```python
-# 旧代码
-class FollowersConsumer(BaseConsumer):
-    async def process_message(self, data):
-        # 处理逻辑
-        pass
-
-# 新代码（只需定义普通异步函数）
-async def process_followers(data: dict):
-    # 相同的处理逻辑
-    pass
-
-# 然后在 Worker 中注册
-worker.add_function(process_followers)
-```
-
 ## 性能优化
 
 ### 高并发配置

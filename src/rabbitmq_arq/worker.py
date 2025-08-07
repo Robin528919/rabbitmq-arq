@@ -113,7 +113,6 @@ class WorkerUtils:
     """
 
     def __init__(self, worker_settings=None):
-        self.loop = asyncio.get_event_loop()
         self.allow_pick_jobs = True
         self.tasks: dict[str, asyncio.Task] = {}
         self.main_task: asyncio.Task | None = None
@@ -172,7 +171,7 @@ class WorkerUtils:
             # 在 burst 模式下，可以选择立即退出或等待任务完成
             if self.worker_settings.burst_wait_for_tasks and running_tasks > 0:
                 logger.info(f'⏳ Burst 模式：等待 {running_tasks} 个正在执行的任务完成...')
-                self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+                asyncio.create_task(self._wait_for_tasks_to_complete(signum=sig))
             else:
                 if running_tasks > 0:
                     logger.info(f'🚫 Burst 模式：不等待任务完成，取消 {running_tasks} 个正在执行的任务')
@@ -187,9 +186,12 @@ class WorkerUtils:
             logger.info(f'🔄 常规模式：开始优雅关闭，停止接收新任务')
             self.allow_pick_jobs = False
             if running_tasks > 0:
+                # 获取等待超时时间，如果没有配置则使用默认值
+                timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
+                          if self.worker_settings else None) or 30
                 logger.info(
-                    f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{self.worker_settings.wait_for_job_completion_on_signal_second}秒）')
-                self.loop.create_task(self._wait_for_tasks_to_complete(signum=sig))
+                    f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{timeout}秒）')
+                asyncio.create_task(self._wait_for_tasks_to_complete(signum=sig))
             else:
                 logger.info('✅ 没有正在执行的任务，可以立即关闭')
                 self.shutdown_event.set()
@@ -256,9 +258,33 @@ class WorkerUtils:
 
     def _add_signal_handler(self, signum: Signals, handler: Callable[[Signals], None]) -> None:
         try:
-            self.loop.add_signal_handler(signum, partial(handler, signum))
+            # 使用当前运行的事件循环，而不是保存的循环引用
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signum, partial(handler, signum))
+            logger.debug(f"✅ 已设置 {signum.name} 信号处理器")
         except NotImplementedError:  # pragma: no cover
             logger.debug('Windows 不支持向事件循环添加信号处理器')
+        except RuntimeError as e:
+            logger.warning(f"⚠️ 无法设置 {signum.name} 信号处理器: {e}")
+
+    async def _safe_operation_with_timeout(self, operation, operation_name: str, timeout: float = 30.0):
+        """
+        安全执行操作，带超时保护和异常处理
+        
+        Args:
+            operation: 要执行的协程操作
+            operation_name: 操作名称，用于日志
+            timeout: 超时时间（秒）
+        """
+        try:
+            logger.debug(f"🔧 开始执行 {operation_name}...")
+            await asyncio.wait_for(operation, timeout=timeout)
+            logger.debug(f"✅ {operation_name} 执行成功")
+        except asyncio.TimeoutError:
+            logger.warning(f"⏰ {operation_name} 执行超时 ({timeout}秒)")
+        except Exception as e:
+            logger.error(f"❌ {operation_name} 执行失败: {e}")
+            logger.debug(f"详细错误信息: {traceback.format_exc()}")
 
     async def graceful_shutdown(self, reason: str = "用户请求") -> None:
         """
@@ -297,13 +323,13 @@ class WorkerUtils:
                     if not t.done():
                         t.cancel()
 
-        # 关闭连接
-        try:
-            if self.connection and not self.connection.is_closed:
-                await self.connection.close()
-                logger.info('🔌 RabbitMQ 连接已关闭')
-        except Exception as e:
-            logger.error(f'❌ 关闭连接时发生错误: {e}')
+        # 关闭连接 - 使用超时保护
+        if self.connection and not self.connection.is_closed:
+            await self._safe_operation_with_timeout(
+                self.connection.close(),
+                "RabbitMQ 连接关闭 (graceful_shutdown)",
+                timeout=10.0
+            )
 
         # 设置关闭事件
         self.shutdown_event.set()
@@ -365,18 +391,27 @@ class Worker(WorkerUtils):
         self._delay_queue_name = None
         self._delay_mechanism_detected = False
 
-        # 现在子类属性都初始化完成了，可以设置信号处理器
-        self._setup_signal_handlers()
+        # 信号处理器将在 main() 方法中设置，因为此时事件循环还没有运行
 
     def _setup_signal_handlers(self) -> None:
         """设置信号处理器"""
         if not self._signal_handlers_enabled:
             logger.info("🔧 正在设置信号处理器...")
-            self._add_signal_handler(signal.SIGINT, self.handle_sig_wait_for_completion)
-            self._add_signal_handler(signal.SIGTERM, self.handle_sig_wait_for_completion)
+            
+            # 设置主要的终止信号处理器
+            signals_to_handle = [signal.SIGINT, signal.SIGTERM]
+            
+            # 在非Windows系统上添加SIGHUP支持
+            if hasattr(signal, 'SIGHUP'):
+                signals_to_handle.append(signal.SIGHUP)
+            
+            for sig in signals_to_handle:
+                self._add_signal_handler(sig, self.handle_sig_wait_for_completion)
+            
             self._signal_handlers_enabled = True
-            logger.info("✅ 信号处理器设置完成 (SIGINT, SIGTERM)")
-            logger.info("💡 提示: 请使用 Ctrl+C 或 kill -TERM <pid> 优雅停止 Worker")
+            signal_names = [sig.name for sig in signals_to_handle]
+            logger.info(f"✅ 信号处理器设置完成 ({', '.join(signal_names)})")
+            logger.info("💡 提示: 请使用 Ctrl+C、kill -TERM 或 kill -HUP 优雅停止 Worker")
 
     async def _init(self) -> None:
         """初始化连接"""
@@ -948,23 +983,51 @@ class Worker(WorkerUtils):
             self._health_check_task = asyncio.create_task(self._health_check_loop())
 
         # 开始消费消息（Burst 和常规模式都需要）
-        await queue.consume(lambda message: asyncio.create_task(self.on_message(message)))
+        consumer_tag = await queue.consume(lambda message: asyncio.create_task(self.on_message(message)))
+        logger.debug(f"🔧 消息消费器已启动，consumer_tag: {consumer_tag}")
 
         try:
             # 等待关闭信号或被取消
             await self.shutdown_event.wait()
-            logger.info("收到关闭信号，准备退出消费循环")
+            logger.info("🛑 收到关闭信号，准备退出消费循环")
         except asyncio.CancelledError:
             if self._burst_mode:
-                logger.info("🏁 Burst 模式消费者退出")
+                logger.info("🏁 Burst 模式消费者被取消")
             else:
-                logger.info("消费者被取消")
+                logger.info("🛑 常规模式消费者被取消")
+            raise
         finally:
-            # 清理任务
+            # 关键改进：停止消息消费器
+            if consumer_tag and not self.channel.is_closed:
+                try:
+                    logger.info("🔧 正在停止消息消费器...")
+                    await self._safe_operation_with_timeout(
+                        queue.cancel(consumer_tag),
+                        "消息消费器停止",
+                        timeout=5.0
+                    )
+                    logger.info("✅ 消息消费器已停止")
+                except Exception as e:
+                    logger.warning(f"⚠️ 停止消费器时出现错误: {e}")
+
+            # 清理后台任务
             if self._health_check_task:
+                logger.debug("🔧 取消健康检查任务...")
                 self._health_check_task.cancel()
+                try:
+                    await self._health_check_task
+                except asyncio.CancelledError:
+                    pass
+                    
             if self._burst_check_task:
+                logger.debug("🔧 取消 Burst 检查任务...")
                 self._burst_check_task.cancel()
+                try:
+                    await self._burst_check_task
+                except asyncio.CancelledError:
+                    pass
+                    
+            logger.info("✅ 消费循环清理完成")
 
     async def main(self) -> None:
         """
@@ -973,6 +1036,9 @@ class Worker(WorkerUtils):
         start_time = datetime.now()
 
         try:
+            # 设置信号处理器（事件循环已经在运行）
+            self._setup_signal_handlers()
+            
             # Burst 模式启动信息
             if self._burst_mode:
                 logger.info(f"🚀 启动 Burst 模式 Worker (超时: {self.worker_settings.burst_timeout}s)")
@@ -1029,20 +1095,34 @@ class Worker(WorkerUtils):
                 except asyncio.TimeoutError:
                     logger.warning("等待任务完成超时，强制退出")
 
-            # 关闭钩子
+            # 关闭钩子 - 使用超时保护
             if self.on_shutdown:
-                logger.info("执行关闭钩子")
+                logger.info("🔧 开始执行关闭钩子...")
                 # 最终同步统计数据
                 self.ctx['jobs_complete'] = self.jobs_complete
                 self.ctx['jobs_failed'] = self.jobs_failed
                 self.ctx['jobs_retried'] = self.jobs_retried
                 self.ctx['jobs_ongoing'] = len(self.tasks)
-                await self.on_shutdown(self.ctx)
+                
+                # 使用超时保护执行关闭钩子
+                await self._safe_operation_with_timeout(
+                    self.on_shutdown(self.ctx),
+                    "关闭钩子 (on_shutdown)",
+                    timeout=30.0
+                )
+                logger.info("✅ 关闭钩子执行完成")
 
-            # 关闭连接
-            if self.connection:
-                await self.connection.close()
-                logger.info("已关闭 RabbitMQ 连接")
+            # 关闭连接 - 使用超时保护
+            if self.connection and not self.connection.is_closed:
+                logger.info("🔧 开始关闭 RabbitMQ 连接...")
+                await self._safe_operation_with_timeout(
+                    self.connection.close(),
+                    "RabbitMQ 连接关闭",
+                    timeout=10.0
+                )
+                logger.info("✅ RabbitMQ 连接已关闭")
+            elif self.connection and self.connection.is_closed:
+                logger.info("ℹ️ RabbitMQ 连接已经关闭")
 
     @classmethod
     def run(cls, worker_settings: WorkerSettings):

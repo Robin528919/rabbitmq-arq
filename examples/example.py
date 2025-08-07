@@ -118,10 +118,10 @@ async def send_email(ctx: JobContext, to: str, subject: str, body: str):
     try:
         # 模拟邮件发送逻辑
         task_logger.info("正在连接邮件服务器...")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
 
         task_logger.info("正在发送邮件...")
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
         # 模拟一些可能失败的情况
         if "fail" in to.lower():
@@ -307,9 +307,9 @@ async def main():
 
         email_jobs = []
         emails = [
-            # ("user1@example.com", "欢迎使用 RabbitMQ-ARQ", "这是一个欢迎邮件"),
-            # ("user2@example.com", "系统通知", "您的账户信息已更新"),
-            ("fail@example.com", "测试失败", "这封邮件会发送失败"),  # 测试失败重试
+            ("user1@example.com", "欢迎使用 RabbitMQ-ARQ", "这是一个欢迎邮件"),
+            ("user2@example.com", "系统通知", "您的账户信息已更新"),
+            # ("fail@example.com", "测试失败", "这封邮件会发送失败"),  # 测试失败重试
         ]
 
         for to, subject, body in emails:
@@ -323,12 +323,12 @@ async def main():
             email_jobs.append(job)
             logger.info(f"   邮件任务 {job.job_id} 已提交 (发送到 {to})")
         # 参数错误
-        job = await client.enqueue_job(
-            "send_email",
-            aaa="123",
-            queue_name=default_queue_name
-        )
-        email_jobs.append(job)
+        # job = await client.enqueue_job(
+        #     "send_email",
+        #     aaa="123",
+        #     queue_name=default_queue_name
+        # )
+        # email_jobs.append(job)
         # # 提交一些延迟任务
         # logger.info("📤 提交延迟任务...")
         #
