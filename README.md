@@ -25,17 +25,31 @@ pip install rabbitmq-arq
 
 ```python
 import asyncio
+from rabbitmq_arq import JobContext, Retry
 
-# 定义任务（普通异步函数）
-async def send_email(to: str, subject: str, body: str) -> bool:
-    # 你的邮件发送逻辑
+# 定义任务（带上下文的异步函数）
+async def send_email(ctx: JobContext, to: str, subject: str, body: str) -> dict:
+    """发送邮件任务"""
     print(f"发送邮件到 {to}: {subject}")
-    await asyncio.sleep(1)  # 模拟异步操作
-    return True
+    print(f"任务ID: {ctx.job_id}, 尝试次数: {ctx.job_try}")
+    
+    # 模拟邮件发送逻辑
+    await asyncio.sleep(1)
+    
+    # 模拟可能的失败和重试
+    if "fail" in to and ctx.job_try <= 2:
+        raise Retry(defer=5)  # 5秒后重试
+    
+    return {"to": to, "subject": subject, "sent_at": asyncio.get_event_loop().time()}
 
-async def process_data(data: dict) -> dict:
+async def process_data(ctx: JobContext, data: dict) -> dict:
+    """数据处理任务"""
+    print(f"处理数据: {data}")
+    print(f"任务ID: {ctx.job_id}")
+    
     # 数据处理逻辑
-    result = {"processed": True, "count": len(data)}
+    await asyncio.sleep(0.5)
+    result = {"processed": True, "count": len(data), "processed_at": asyncio.get_event_loop().time()}
     return result
 ```
 
@@ -43,25 +57,48 @@ async def process_data(data: dict) -> dict:
 
 ```python
 import asyncio
-from rabbitmq_arq import RabbitMQClient, create_client
+from rabbitmq_arq import RabbitMQClient
 from rabbitmq_arq.connections import RabbitMQSettings
+from datetime import datetime, timedelta
 
 async def main():
     # 创建客户端
-    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+    settings = RabbitMQSettings(rabbitmq_url="amqp://localhost:5672")
     client = RabbitMQClient(settings)
     
     # 连接并发送任务
     await client.connect()
     
+    # 提交即时任务
     job = await client.enqueue_job(
         "send_email",  # 任务名称
         to="user@example.com",
         subject="欢迎使用 RabbitMQ ARQ",
-        body="这是一个测试邮件"
+        body="这是一个测试邮件",
+        queue_name="default"  # 指定队列
     )
+    print(f"即时任务已提交: {job.job_id}")
     
-    print(f"任务已提交: {job.job_id}")
+    # 提交延迟任务（延迟10秒）
+    delayed_job = await client.enqueue_job(
+        "process_data",
+        data={"key": "value", "count": 100},
+        queue_name="default",
+        _defer_by=10  # 延迟10秒执行
+    )
+    print(f"延迟任务已提交: {delayed_job.job_id}")
+    
+    # 提交定时任务（指定时间执行）
+    scheduled_job = await client.enqueue_job(
+        "send_email",
+        to="scheduled@example.com",
+        subject="定时邮件",
+        body="这是一个定时邮件",
+        queue_name="default",
+        defer_until=datetime.now() + timedelta(hours=1)  # 1小时后执行
+    )
+    print(f"定时任务已提交: {scheduled_job.job_id}")
+    
     await client.close()
 
 if __name__ == "__main__":
@@ -75,26 +112,55 @@ import asyncio
 from rabbitmq_arq import Worker, WorkerSettings
 from rabbitmq_arq.connections import RabbitMQSettings
 
+# 生命周期钩子函数
+async def startup_hook(ctx: dict):
+    """Worker 启动时执行"""
+    print("🚀 Worker 启动中...")
+    # 初始化资源，如数据库连接等
+    ctx['start_time'] = asyncio.get_event_loop().time()
+
+async def shutdown_hook(ctx: dict):
+    """Worker 关闭时执行"""
+    print("🛑 Worker 关闭中...")
+    # 清理资源
+    start_time = ctx.get('start_time', 0)
+    runtime = asyncio.get_event_loop().time() - start_time
+    print(f"运行时间: {runtime:.1f}秒")
+
 async def main():
     # 配置设置
     rabbitmq_settings = RabbitMQSettings(
-        connection_url="amqp://localhost:5672"
+        rabbitmq_url="amqp://localhost:5672",
+        prefetch_count=100,  # 消息预取数量
+        connection_timeout=30
     )
+    
     worker_settings = WorkerSettings(
-        queues=["default"],
-        prefetch_count=5000,  # 高并发处理
-        max_workers=10
+        rabbitmq_settings=rabbitmq_settings,
+        functions=[send_email, process_data],  # 任务函数列表
+        worker_name="demo_worker",
+        
+        # 队列配置
+        queue_name="default",
+        dlq_name="default_dlq",  # 死信队列
+        
+        # 任务处理配置
+        max_retries=3,
+        retry_backoff=5.0,
+        job_timeout=300,
+        max_concurrent_jobs=10,
+        
+        # 生命周期钩子
+        on_startup=startup_hook,
+        on_shutdown=shutdown_hook,
+        
+        # 日志配置
+        log_level="INFO"
     )
     
-    # 创建工作器
-    worker = Worker(rabbitmq_settings, worker_settings)
-    
-    # 注册任务函数
-    worker.add_function(send_email)
-    worker.add_function(process_data)
-    
-    # 启动工作器
-    await worker.async_run()
+    # 创建并启动工作器
+    worker = Worker(worker_settings)
+    await worker.main()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -103,11 +169,27 @@ if __name__ == "__main__":
 ### 命令行工具
 
 ```bash
-# 启动工作器
-rabbitmq-arq worker --connection amqp://localhost:5672 --queues default --workers 10
+# 启动常规模式 Worker
+rabbitmq-arq worker -m myapp.workers:worker_settings
 
-# 监控队列状态
-rabbitmq-arq monitor --connection amqp://localhost:5672
+# 启动 Burst 模式 Worker（处理完队列后自动退出）
+rabbitmq-arq worker -m myapp.workers:worker_settings --burst
+
+# 自定义配置启动 Worker
+rabbitmq-arq worker -m myapp.workers:worker_settings \
+    --rabbitmq-url amqp://user:pass@localhost:5672/ \
+    --queue my_queue \
+    --max-concurrent-jobs 20 \
+    --burst-timeout 600
+
+# 查看队列信息
+rabbitmq-arq queue-info --queue default
+
+# 清空队列
+rabbitmq-arq purge-queue --queue default
+
+# 验证 Worker 配置
+rabbitmq-arq validate-config -m myapp.workers:worker_settings
 ```
 
 ## 高级特性
@@ -118,46 +200,89 @@ RabbitMQ-ARQ 具有智能错误分类和自动重试机制：
 
 ```python
 import random
-from rabbitmq_arq.exceptions import Retry
+from rabbitmq_arq import JobContext, Retry
+from rabbitmq_arq.exceptions import MaxRetriesExceeded
 
-async def reliable_task(data: str) -> str:
-    # 可能失败的任务，会自动重试
-    if random.random() < 0.3:
+async def reliable_task(ctx: JobContext, data: str) -> str:
+    """具有重试机制的可靠任务"""
+    print(f"任务执行，尝试次数: {ctx.job_try}")
+    
+    # 模拟可能失败的操作
+    if random.random() < 0.3 and ctx.job_try <= 2:
         # 抛出 Retry 异常进行重试
-        raise Retry("临时错误，需要重试")
-    return f"处理完成: {data}"
+        raise Retry(defer=5)  # 5秒后重试
+    
+    if ctx.job_try > 3:
+        # 达到最大重试次数
+        raise MaxRetriesExceeded(f"任务失败超过最大重试次数: {ctx.job_try}")
+    
+    return f"处理完成: {data}，尝试次数: {ctx.job_try}"
 
-# 工作器会自动根据错误类型决定是否重试
-# - 网络错误、超时等：自动重试
-# - 代码错误、类型错误等：不重试，直接失败
+# Worker 的智能错误分类：
+# ✅ 自动重试的错误：
+#   - 网络连接错误（ConnectionError）
+#   - 超时错误（TimeoutError）
+#   - 临时服务不可用
+#   - 显式的 Retry 异常
+#
+# ❌ 不重试的错误：
+#   - 代码语法错误（SyntaxError）
+#   - 类型错误（TypeError）
+#   - 参数错误（ValueError）
+#   - 权限错误（PermissionError）
 ```
 
-### 延迟任务
+### 延迟任务和定时任务
 
 ```python
 import asyncio
 from datetime import datetime, timedelta
-from rabbitmq_arq import RabbitMQClient
+from rabbitmq_arq import RabbitMQClient, JobContext
 from rabbitmq_arq.connections import RabbitMQSettings
 
+# 延迟任务函数
+async def delayed_notification(ctx: JobContext, user_id: int, message: str):
+    """延迟通知任务"""
+    print(f"发送延迟通知给用户 {user_id}: {message}")
+    print(f"任务ID: {ctx.job_id}，计划执行时间已到")
+    return {"user_id": user_id, "message": message, "sent_at": datetime.now()}
+
 async def main():
-    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+    settings = RabbitMQSettings(rabbitmq_url="amqp://localhost:5672")
     client = RabbitMQClient(settings)
     await client.connect()
     
-    # 延迟执行（1小时后）
-    job = await client.enqueue_job(
-        "delayed_task",
-        data={"message": "延迟任务"},
-        defer_until=datetime.now() + timedelta(hours=1)
+    # 方式1: 延迟执行（使用 _defer_by 参数，单位：秒）
+    job1 = await client.enqueue_job(
+        "delayed_notification",
+        user_id=123,
+        message="这是一个延迟30秒的通知",
+        queue_name="default",
+        _defer_by=30  # 30秒后执行
     )
+    print(f"延迟任务已提交: {job1.job_id}")
     
-    # 定时执行（指定时间）
-    job = await client.enqueue_job(
-        "scheduled_task", 
-        data={"message": "定时任务"},
-        defer_until=datetime(2025, 1, 1, 9, 0, 0)
+    # 方式2: 定时执行（使用 defer_until 参数）
+    scheduled_time = datetime.now() + timedelta(hours=2)
+    job2 = await client.enqueue_job(
+        "delayed_notification",
+        user_id=456,
+        message="这是一个定时通知",
+        queue_name="default",
+        defer_until=scheduled_time  # 指定时间执行
     )
+    print(f"定时任务已提交: {job2.job_id}，将在 {scheduled_time} 执行")
+    
+    # 方式3: 固定时间执行
+    fixed_time = datetime(2025, 12, 31, 23, 59, 0)
+    job3 = await client.enqueue_job(
+        "delayed_notification",
+        user_id=789,
+        message="新年祝福",
+        queue_name="default",
+        defer_until=fixed_time
+    )
+    print(f"新年任务已提交: {job3.job_id}")
     
     await client.close()
 
@@ -173,87 +298,221 @@ if __name__ == "__main__":
 from rabbitmq_arq import Worker, WorkerSettings
 from rabbitmq_arq.connections import RabbitMQSettings
 
-# 高性能配置
+# 高性能 RabbitMQ 连接配置
 rabbitmq_settings = RabbitMQSettings(
-    connection_url="amqp://localhost:5672"
-)
-worker_settings = WorkerSettings(
-    queues=["high_performance"],
-    prefetch_count=5000,     # 高预取数量
-    max_workers=20,          # 增加并发工作器
-    burst_check_interval=1.0, # 快速检查
-    health_check_interval=30  # 健康检查间隔
+    rabbitmq_url="amqp://localhost:5672",
+    prefetch_count=5000,     # 高预取数量，提升吞吐量
+    connection_timeout=30,   # 连接超时时间
 )
 
-worker = Worker(rabbitmq_settings, worker_settings)
+# 高性能 Worker 配置
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[your_task_functions],
+    worker_name="high_performance_worker",
+    
+    # 队列配置
+    queue_name="high_performance",
+    dlq_name="high_performance_dlq",
+    
+    # 高并发任务处理配置
+    max_concurrent_jobs=50,   # 增加并发任务数
+    job_timeout=600,         # 任务超时时间
+    max_retries=3,
+    retry_backoff=2.0,
+    
+    # Burst 模式配置（可选）
+    burst_mode=False,        # 持续运行模式
+    burst_check_interval=0.5, # 快速队列检查
+    
+    # 监控配置
+    health_check_interval=30, # 健康检查间隔
+    
+    # 日志配置
+    log_level="INFO"
+)
+
+worker = Worker(worker_settings)
 ```
 
 ### 批量任务提交
 
 ```python
 import asyncio
-from rabbitmq_arq import RabbitMQClient
+from rabbitmq_arq import RabbitMQClient, JobContext
 from rabbitmq_arq.connections import RabbitMQSettings
 
-async def main():
-    settings = RabbitMQSettings(connection_url="amqp://localhost:5672")
+# 批量处理任务函数
+async def batch_process_item(ctx: JobContext, item_id: int, data: str):
+    """批量处理单个项目"""
+    print(f"处理项目 {item_id}: {data}")
+    await asyncio.sleep(0.1)  # 模拟处理时间
+    return {"item_id": item_id, "processed": True, "result": f"processed_{data}"}
+
+async def batch_submit_example():
+    """批量提交任务示例"""
+    settings = RabbitMQSettings(rabbitmq_url="amqp://localhost:5672")
     client = RabbitMQClient(settings)
     await client.connect()
     
-    # 批量提交任务
+    print("开始批量提交任务...")
+    
+    # 方式1: 并发提交任务（推荐）
     tasks = []
-    for i in range(100):
+    for i in range(1000):
         task = client.enqueue_job(
-            "batch_task",
+            "batch_process_item",
             item_id=i,
-            data=f"batch_data_{i}"
+            data=f"batch_data_{i}",
+            queue_name="batch_queue"
         )
         tasks.append(task)
     
     # 等待所有任务提交完成
     jobs = await asyncio.gather(*tasks)
-    print(f"提交了 {len(jobs)} 个任务")
+    print(f"✅ 成功提交了 {len(jobs)} 个任务")
     
+    # 方式2: 分批提交（避免内存占用过大）
+    batch_size = 100
+    total_tasks = 1000
+    submitted_count = 0
+    
+    for batch_start in range(0, total_tasks, batch_size):
+        batch_tasks = []
+        for i in range(batch_start, min(batch_start + batch_size, total_tasks)):
+            task = client.enqueue_job(
+                "batch_process_item",
+                item_id=i + 1000,  # 避免ID重复
+                data=f"batch_data_{i + 1000}",
+                queue_name="batch_queue"
+            )
+            batch_tasks.append(task)
+        
+        # 等待当前批次提交完成
+        batch_jobs = await asyncio.gather(*batch_tasks)
+        submitted_count += len(batch_jobs)
+        print(f"📦 已提交批次 {batch_start//batch_size + 1}，累计: {submitted_count} 个任务")
+    
+    print(f"🎉 批量提交完成，总计: {submitted_count} 个任务")
     await client.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(batch_submit_example())
 ```
 
 ## 监控和日志
 
-### 结构化日志
-
-RabbitMQ-ARQ 内置中文友好的日志系统：
+### 结构化日志和监控
 
 ```python
 import logging
+import asyncio
+from rabbitmq_arq import JobContext
 
-# 配置日志
+# 配置结构化日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('rabbitmq_arq.log')
+    ]
 )
 
-async def logged_task(data: dict):
-    logger = logging.getLogger('rabbitmq-arq.task')
-    logger.info(f"任务开始处理: {data}")
+# 创建专门的日志记录器
+task_logger = logging.getLogger('rabbitmq_arq.task')
+worker_logger = logging.getLogger('rabbitmq_arq.worker')
+stats_logger = logging.getLogger('rabbitmq_arq.stats')
+
+async def logged_task(ctx: JobContext, data: dict):
+    """带有详细日志的任务"""
+    task_logger.info(f"📋 任务开始: ID={ctx.job_id}, 尝试={ctx.job_try}")
+    task_logger.info(f"📥 输入数据: {data}")
     
-    # 处理逻辑
-    result = {"processed": True, "data": data}
+    start_time = asyncio.get_event_loop().time()
     
-    logger.info(f"任务处理完成: {result}")
-    return result
+    try:
+        # 处理逻辑
+        await asyncio.sleep(1)  # 模拟处理时间
+        result = {"processed": True, "data": data, "timestamp": start_time}
+        
+        end_time = asyncio.get_event_loop().time()
+        duration = end_time - start_time
+        
+        task_logger.info(f"✅ 任务完成: 耗时 {duration:.2f}s")
+        task_logger.info(f"📤 输出结果: {result}")
+        
+        return result
+        
+    except Exception as e:
+        end_time = asyncio.get_event_loop().time()
+        duration = end_time - start_time
+        
+        task_logger.error(f"❌ 任务失败: {str(e)}, 耗时 {duration:.2f}s")
+        raise
+
+# Worker 生命周期日志
+async def startup_with_logging(ctx: dict):
+    """带日志的启动钩子"""
+    worker_logger.info("🚀 Worker 启动中...")
+    worker_logger.info("📊 初始化监控指标...")
+    
+    ctx['stats'] = {
+        'start_time': asyncio.get_event_loop().time(),
+        'jobs_completed': 0,
+        'jobs_failed': 0,
+        'total_processing_time': 0.0
+    }
+    
+    worker_logger.info("✅ Worker 启动完成")
+
+async def shutdown_with_logging(ctx: dict):
+    """带日志的关闭钩子"""
+    worker_logger.info("🛑 Worker 正在关闭...")
+    
+    stats = ctx.get('stats', {})
+    runtime = asyncio.get_event_loop().time() - stats.get('start_time', 0)
+    
+    stats_logger.info("📊 Worker 运行统计:")
+    stats_logger.info(f"   总运行时间: {runtime:.1f}s")
+    stats_logger.info(f"   完成任务数: {stats.get('jobs_completed', 0)}")
+    stats_logger.info(f"   失败任务数: {stats.get('jobs_failed', 0)}")
+    stats_logger.info(f"   总处理时间: {stats.get('total_processing_time', 0):.1f}s")
+    
+    worker_logger.info("✅ Worker 关闭完成")
 ```
 
 ### 监控指标
 
-rabbitmq-arq 自动收集以下指标：
+RabbitMQ-ARQ 自动收集以下监控指标：
 
-- 任务执行时间
-- 成功/失败率
-- 队列长度
-- 工作器状态
+- **任务指标**:
+  - 任务执行时间和吞吐量
+  - 成功/失败/重试率
+  - 队列长度和积压情况
+  - 任务类型分布
+
+- **Worker 指标**:
+  - Worker 状态和健康度
+  - 并发任务数量
+  - 内存和CPU使用情况
+  - 连接状态
+
+- **系统指标**:
+  - RabbitMQ 连接池状态
+  - 消息确认和拒绝率
+  - 延迟任务调度准确性
+  - 错误分类统计
+
+可以通过命令行工具查看实时指标：
+
+```bash
+# 查看队列状态
+rabbitmq-arq queue-info --queue default
+
+# 监控 Worker 性能（如果配置了监控端点）
+curl http://localhost:8080/metrics
+```
 
 ## 开发
 
@@ -311,10 +570,20 @@ mypy src
 
 ### 环境变量
 
-- `RABBITMQ_URL`: RabbitMQ 连接 URL (默认: `amqp://localhost:5672`)
+支持以下环境变量配置：
+
+- `RABBITMQ_URL`: RabbitMQ 连接 URL (默认: `amqp://guest:guest@localhost:5672/`)
+- `RABBITMQ_PREFETCH_COUNT`: 消息预取数量 (默认: `100`)
+- `RABBITMQ_CONNECTION_TIMEOUT`: 连接超时时间秒数 (默认: `30`)
 - `ARQ_LOG_LEVEL`: 日志级别 (默认: `INFO`)
-- `ARQ_MAX_WORKERS`: 最大工作器数量 (默认: `10`)
-- `ARQ_PREFETCH_COUNT`: 预取消息数量 (默认: `5000`)
+- `ARQ_MAX_CONCURRENT_JOBS`: 最大并发任务数 (默认: `10`)
+- `ARQ_JOB_TIMEOUT`: 任务超时时间秒数 (默认: `300`)
+- `ARQ_MAX_RETRIES`: 最大重试次数 (默认: `3`)
+- `ARQ_RETRY_BACKOFF`: 重试退避时间秒数 (默认: `5.0`)
+- `ARQ_WORKER_NAME`: Worker 名称 (默认: 自动生成)
+- `ARQ_QUEUE_NAME`: 默认队列名称 (默认: `arq:queue`)
+- `ARQ_BURST_MODE`: 是否启用 Burst 模式 (默认: `False`)
+- `ARQ_BURST_TIMEOUT`: Burst 模式超时时间秒数 (默认: `300`)
 
 ### 配置文件
 
@@ -349,10 +618,25 @@ MIT License - 详见 [LICENSE](LICENSE) 文件。
 
 ## 更新日志
 
-### v0.1.0
+### v0.1.0 (最新版本)
 
-- 初始版本发布
-- 基本的任务队列功能
-- 装饰器风格的任务定义
-- 高性能工作器实现
-- 中文日志支持 
+**核心功能**:
+- ✅ 基于 RabbitMQ 的异步任务队列实现
+- ✅ 类似 ARQ 的简洁 API 设计
+- ✅ 支持即时任务、延迟任务和定时任务
+- ✅ 智能错误分类和自动重试机制
+- ✅ 高性能工作器实现 (≥5000 消息/秒)
+
+**高级特性**:
+- ✅ JobContext 上下文支持，提供任务元信息
+- ✅ Burst 模式支持（处理完队列后自动退出）
+- ✅ 生命周期钩子函数（startup, shutdown, job_start, job_end）
+- ✅ 死信队列 (DLQ) 支持
+- ✅ 完整的命令行工具集
+
+**开发体验**:
+- ✅ 中文友好的日志和错误信息
+- ✅ 详细的类型注解和文档
+- ✅ 完整的测试覆盖
+- ✅ 灵活的配置系统
+- ✅ 监控和健康检查支持 
