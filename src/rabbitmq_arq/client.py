@@ -19,6 +19,7 @@ from .connections import RabbitMQSettings
 from .exceptions import SerializationError, RabbitMQConnectionError
 from .job import Job
 from .models import JobModel, JobStatus
+from .result_storage.models import JobResult
 
 # 获取日志记录器
 logger = logging.getLogger('rabbitmq-arq.client')
@@ -421,8 +422,49 @@ class RabbitMQClient:
             )
             logger.info(f"📤 任务已提交: {job.job_id} -> {queue_name}")
 
+        # 为所有任务创建初始状态记录（ARQ风格：任务提交即可查询）
+        await self._store_initial_job_state(job)
+
         # 返回Job对象而不是JobModel
         return Job(job_id=job.job_id, result_store=self.result_store)
+
+    async def _store_initial_job_state(self, job: JobModel) -> None:
+        """
+        为任务创建初始状态记录
+        
+        Args:
+            job: 任务模型对象
+        """
+        if not self.result_store:
+            return
+
+        try:
+            # 创建初始任务结果记录（状态为 QUEUED）
+            initial_job_result = JobResult(
+                job_id=job.job_id,
+                status=job.status,  # JobStatus.QUEUED
+                result=None,
+                error=None,
+                start_time=job.enqueue_time,  # 使用入队时间作为开始时间
+                end_time=None,
+                duration=None,
+                worker_id="pending",  # 暂未分配Worker
+                queue_name=job.queue_name,
+                retry_count=0,
+                function_name=job.function,
+                args=job.args,
+                kwargs=job.kwargs,
+                expires_at=job.expires
+            )
+
+            # 异步存储初始状态
+            await self.result_store.store_result(initial_job_result)
+            status_value = job.status.value if hasattr(job.status, 'value') else str(job.status)
+            logger.debug(f"✅ 初始任务状态已存储: {job.job_id} -> {status_value}")
+
+        except Exception as e:
+            logger.warning(f"⚠️ 存储初始任务状态失败 {job.job_id}: {e}")
+            # 存储失败不影响任务提交流程
 
     async def _send_delayed_job(self, message_body: bytes, queue_name: str, delay_seconds: float, headers: dict | None = None):
         """
