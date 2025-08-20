@@ -147,6 +147,7 @@ class WorkerSettings:
                  # === 任务结果配置 ===
                  enable_job_result_storage: bool = True,
                  job_result_ttl: int = 86400,
+                 job_result_store_url: str = "redis://localhost:6379/0",
 
                  # === Worker 运行时配置 ===
                  health_check_interval: int = 30,
@@ -209,6 +210,13 @@ class WorkerSettings:
             max_concurrent_jobs: 最大并发任务数
             enable_job_result_storage: 是否存储任务结果
             job_result_ttl: 任务结果保存时间（秒）
+            job_result_store_url: 结果存储连接URL（通过URL自动识别存储类型）
+                - Redis: "redis://localhost:6379/0" 或 "redis://user:pass@host:port/db"
+                - Redis SSL: "rediss://localhost:6379/0"
+                - PostgreSQL: "postgresql://user:pass@host:port/dbname"
+                - MySQL: "mysql://user:pass@host:port/dbname"
+                - MongoDB: "mongodb://localhost:27017/dbname"
+                - S3: "s3://bucket/path"
             health_check_interval: 健康检查间隔（秒）
             job_completion_wait: 关闭时等待任务完成时间（秒）
             graceful_shutdown_timeout: 优雅关闭总超时（秒）
@@ -258,6 +266,7 @@ class WorkerSettings:
         # === 任务结果配置 ===
         self.enable_job_result_storage = enable_job_result_storage
         self.job_result_ttl = job_result_ttl
+        self.job_result_store_url = job_result_store_url
 
         # === Worker 运行时配置 ===
         self.health_check_interval = health_check_interval

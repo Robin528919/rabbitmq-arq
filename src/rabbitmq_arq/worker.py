@@ -25,6 +25,7 @@ from .connections import WorkerSettings
 from .exceptions import Retry, JobTimeout, MaxRetriesExceeded, RabbitMQConnectionError
 from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine
+from .result_storage.factory import create_result_store_from_settings
 
 logger = logging.getLogger('rabbitmq-arq.worker')
 
@@ -143,8 +144,8 @@ class WorkerUtils:
 
         # 连接相关属性 - 子类会覆盖这些默认值
         self.connection: Any = None  # aio_pika.Connection
-        self.channel: Any = None     # aio_pika.Channel  
-        self.dlq_channel: Any = None # aio_pika.Channel
+        self.channel: Any = None  # aio_pika.Channel
+        self.dlq_channel: Any = None  # aio_pika.Channel
 
         # 设置信号处理器的标志，子类可以控制是否启用
         self._signal_handlers_enabled = False
@@ -168,10 +169,10 @@ class WorkerUtils:
             logger.info(f'🛑 Burst 模式收到信号 {sig.name}，开始优雅关闭')
             self.allow_pick_jobs = False
             self._burst_should_exit = True
-            
+
             # 立即取消消费者，停止接收新消息
             asyncio.create_task(self._cancel_consumer())
-            
+
             # 在 burst 模式下，可以选择立即退出或等待任务完成
             if self.worker_settings.burst_wait_for_tasks and running_tasks > 0:
                 logger.info(f'⏳ Burst 模式：等待 {running_tasks} 个正在执行的任务完成...')
@@ -189,14 +190,14 @@ class WorkerUtils:
         else:
             logger.info(f'🔄 常规模式：开始优雅关闭，停止接收新任务')
             self.allow_pick_jobs = False
-            
+
             # 立即取消消费者，停止接收新消息
             asyncio.create_task(self._cancel_consumer())
-            
+
             if running_tasks > 0:
                 # 获取等待超时时间，如果没有配置则使用默认值
                 timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
-                          if self.worker_settings else None) or 30
+                           if self.worker_settings else None) or 30
                 logger.info(
                     f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{timeout}秒）')
                 asyncio.create_task(self._wait_for_tasks_to_complete(signum=sig))
@@ -283,7 +284,7 @@ class WorkerUtils:
             if not self.channel or self.channel.is_closed:
                 logger.warning("⚠️ 消息通道已关闭，无法取消消费者")
                 return
-                
+
             try:
                 logger.info("🛑 立即停止消息消费者，阻止接收新消息")
                 await self._safe_operation_with_timeout(
@@ -319,7 +320,7 @@ class WorkerUtils:
 
     async def graceful_shutdown(self, reason: str = "用户请求") -> None:
         """
-        优雅关闭 Worker
+        基础优雅关闭方法 - 不包含特定的结果存储逻辑
         
         Args:
             reason: 关闭原因，用于日志记录
@@ -333,7 +334,7 @@ class WorkerUtils:
 
         # 停止接收新任务
         self.allow_pick_jobs = False
-        
+
         # 立即取消消费者，停止接收新消息
         await self._cancel_consumer()
 
@@ -367,7 +368,7 @@ class WorkerUtils:
 
         # 设置关闭事件
         self.shutdown_event.set()
-        logger.info('✅ Worker 优雅关闭完成')
+        logger.info('✅ Worker 基础关闭完成')
 
 
 class Worker(WorkerUtils):
@@ -429,23 +430,85 @@ class Worker(WorkerUtils):
         self._consumer_tag: str | None = None
         self._queue = None
 
+        # 结果存储初始化
+        self.result_store = None
+        self._init_result_store()
+
         # 信号处理器将在 main() 方法中设置，因为此时事件循环还没有运行
+
+    def _init_result_store(self) -> None:
+        """初始化结果存储"""
+        if not self.worker_settings.enable_job_result_storage:
+            logger.info("任务结果存储已禁用")
+            return
+        try:
+            self.result_store = create_result_store_from_settings(
+                store_url=self.worker_settings.job_result_store_url,
+                enabled=self.worker_settings.enable_job_result_storage,
+                ttl=self.worker_settings.job_result_ttl
+            )
+
+            if self.result_store:
+                from .result_storage.url_parser import parse_store_type_from_url
+                store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
+                logger.info(f"任务结果存储已初始化: {store_type} ({self.worker_settings.job_result_store_url})")
+
+        except Exception as e:
+            logger.error(f"初始化结果存储失败: {e}")
+            logger.info("将在不存储结果的情况下继续运行")
+
+    async def _store_job_result(self, job: JobModel) -> None:
+        """存储任务结果
+        
+        Args:
+            job: 任务模型，包含执行结果和元数据
+        """
+        if not self.result_store:
+            return  # 结果存储未启用或初始化失败
+
+        try:
+            from .result_storage.models import JobResult
+
+            # 构建结果对象
+            job_result = JobResult(
+                job_id=job.job_id,
+                status=job.status,
+                result=job.result,
+                error=job.error,
+                start_time=job.start_time,
+                end_time=job.end_time,
+                duration=(job.end_time - job.start_time).total_seconds() if job.end_time else None,
+                worker_id=self.worker_id,
+                queue_name=job.queue_name,
+                retry_count=job.job_try - 1,  # job_try 从1开始
+                function_name=job.function,
+                args=job.args,
+                kwargs=job.kwargs
+            )
+
+            # 异步存储结果
+            await self.result_store.store_result(job_result)
+            logger.debug(f"任务结果已存储: {job.job_id} - {job.status}")
+
+        except Exception as e:
+            # 存储失败不应影响任务处理流程
+            logger.warning(f"存储任务结果失败 {job.job_id}: {e}")
 
     def _setup_signal_handlers(self) -> None:
         """设置信号处理器"""
         if not self._signal_handlers_enabled:
             logger.info("🔧 正在设置信号处理器...")
-            
+
             # 设置主要的终止信号处理器
             signals_to_handle = [signal.SIGINT, signal.SIGTERM]
-            
+
             # 在非Windows系统上添加SIGHUP支持
             if hasattr(signal, 'SIGHUP'):
                 signals_to_handle.append(signal.SIGHUP)
-            
+
             for sig in signals_to_handle:
                 self._add_signal_handler(sig, self.handle_sig_wait_for_completion)
-            
+
             self._signal_handlers_enabled = True
             signal_names = [sig.name for sig in signals_to_handle]
             logger.info(f"✅ 信号处理器设置完成 ({', '.join(signal_names)})")
@@ -622,8 +685,9 @@ class Worker(WorkerUtils):
                 )
             else:
                 # 同步函数在线程池中执行
+                loop = asyncio.get_running_loop()
                 result = await asyncio.wait_for(
-                    self.loop.run_in_executor(None, partial(func, job_ctx, *job.args, **job.kwargs)),
+                    loop.run_in_executor(None, partial(func, job_ctx, *job.args, **job.kwargs)),
                     timeout=self.worker_settings.job_timeout
                 )
 
@@ -635,13 +699,19 @@ class Worker(WorkerUtils):
 
             logger.info(f"任务 {job.job_id} 执行成功，耗时 {(job.end_time - job.start_time).total_seconds():.2f} 秒")
 
+            # 存储任务结果
+            await self._store_job_result(job)
+
             # 无需更新全局统计，将通过钩子传递
 
         except asyncio.TimeoutError:
             job.status = JobStatus.FAILED
             job.error = f"任务执行超时 ({self.worker_settings.job_timeout}秒)"
+            job.end_time = datetime.now()
             self.jobs_failed += 1
             logger.error(f"任务 {job.job_id} 执行超时")
+            # 存储失败结果
+            await self._store_job_result(job)
             raise JobTimeout(job.error)
 
         except Retry as e:
@@ -658,6 +728,9 @@ class Worker(WorkerUtils):
                 logger.error(f"任务 {job.job_id} 已达到最大重试次数 {self.worker_settings.max_retries}，发送到死信队列")
                 job.status = JobStatus.FAILED
                 job.error = f"任务超过最大重试次数 {self.worker_settings.max_retries}"
+                job.end_time = datetime.now()
+                # 存储最终失败结果
+                await self._store_job_result(job)
                 return  # 直接返回，不再重试
 
             # 计算重试延迟
@@ -677,8 +750,12 @@ class Worker(WorkerUtils):
         except Exception as e:
             job.status = JobStatus.FAILED
             job.error = f"{type(e).__name__}: {str(e)}"
+            job.end_time = datetime.now()
             self.jobs_failed += 1
             logger.error(f"任务 {job.job_id} 执行失败: {job.error}\n{traceback.format_exc()}")
+
+            # 存储失败结果
+            await self._store_job_result(job)
 
             # 无需更新全局统计，将通过钩子传递
 
@@ -1059,7 +1136,7 @@ class Worker(WorkerUtils):
                     await self._health_check_task
                 except asyncio.CancelledError:
                     pass
-                    
+
             if self._burst_check_task:
                 logger.debug("🔧 取消 Burst 检查任务...")
                 self._burst_check_task.cancel()
@@ -1067,7 +1144,7 @@ class Worker(WorkerUtils):
                     await self._burst_check_task
                 except asyncio.CancelledError:
                     pass
-                    
+
             logger.info("✅ 消费循环清理完成")
 
     async def main(self) -> None:
@@ -1079,7 +1156,7 @@ class Worker(WorkerUtils):
         try:
             # 设置信号处理器（事件循环已经在运行）
             self._setup_signal_handlers()
-            
+
             # Burst 模式启动信息
             if self._burst_mode:
                 logger.info(f"🚀 启动 Burst 模式 Worker (超时: {self.worker_settings.burst_timeout}s)")
@@ -1144,7 +1221,7 @@ class Worker(WorkerUtils):
                 self.ctx['jobs_failed'] = self.jobs_failed
                 self.ctx['jobs_retried'] = self.jobs_retried
                 self.ctx['jobs_ongoing'] = len(self.tasks)
-                
+
                 # 使用超时保护执行关闭钩子
                 await self._safe_operation_with_timeout(
                     self.on_shutdown(self.ctx),
@@ -1164,6 +1241,68 @@ class Worker(WorkerUtils):
                 logger.info("✅ RabbitMQ 连接已关闭")
             elif self.connection and self.connection.is_closed:
                 logger.info("ℹ️ RabbitMQ 连接已经关闭")
+
+    async def graceful_shutdown(self, reason: str = "用户请求") -> None:
+        """
+        Worker的优雅关闭方法 - 包含结果存储处理
+        
+        重写父类方法，增加结果存储的关闭处理
+        
+        Args:
+            reason: 关闭原因，用于日志记录
+        """
+        running_tasks = len(self.tasks)
+        logger.info(
+            f'🔄 开始优雅关闭 Worker - 原因: {reason}'
+            f' - 统计信息: ✅完成:{self.jobs_complete} ❌失败:{self.jobs_failed} '
+            f'🔄重试:{self.jobs_retried} ⏳运行中:{running_tasks}'
+        )
+
+        # 停止接收新任务
+        self.allow_pick_jobs = False
+
+        # 立即取消消费者，停止接收新消息
+        await self._cancel_consumer()
+
+        # 如果有正在运行的任务，等待它们完成
+        if running_tasks > 0:
+            # 统一的超时时间获取逻辑
+            timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
+                       if self.worker_settings else None) or 30
+            logger.info(f'⏳ 等待 {running_tasks} 个正在执行的任务完成（超时时间：{timeout}秒）')
+
+            try:
+                await asyncio.wait_for(
+                    self._sleep_until_tasks_complete(),
+                    timeout=timeout
+                )
+                logger.info('✅ 所有任务已完成，开始关闭连接')
+            except asyncio.TimeoutError:
+                remaining = len(self.tasks)
+                logger.warning(f'⏰ 等待超时，强制取消 {remaining} 个未完成的任务')
+                for t in self.tasks.values():
+                    if not t.done():
+                        t.cancel()
+
+        # 关闭结果存储连接
+        if self.result_store:
+            try:
+                await self.result_store.close()
+                logger.info('✅ 结果存储连接已关闭')
+            except Exception as e:
+                logger.warning(f'⚠️ 关闭结果存储时出错: {e}')
+
+        # 关闭连接 - 使用超时保护
+        if self.connection and not self.connection.is_closed:
+            await self._safe_operation_with_timeout(
+                self.connection.close(),
+                "RabbitMQ 连接关闭 (graceful_shutdown)",
+                timeout=10.0
+            )
+
+        # 设置关闭事件
+        self.shutdown_event.set()
+        logger.info('✅ Worker 优雅关闭完成')
 
     @classmethod
     def run(cls, worker_settings: WorkerSettings):

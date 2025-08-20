@@ -33,12 +33,14 @@ class RabbitMQClient:
     每个队列支持独立的延迟机制检测和配置。
     """
 
-    def __init__(self, rabbitmq_settings: RabbitMQSettings | None = None) -> None:
+    def __init__(self, rabbitmq_settings: RabbitMQSettings | None = None,
+                 result_store_url: str = "redis://localhost:6379/0") -> None:
         """
         初始化客户端
         
         Args:
             rabbitmq_settings: RabbitMQ 连接配置，如果为 None 则使用默认配置
+            result_store_url: 结果存储URL，通过URL自动识别存储类型
         """
         self.rabbitmq_settings = rabbitmq_settings or RabbitMQSettings()
         self.connection: RobustConnection | None = None
@@ -47,6 +49,30 @@ class RabbitMQClient:
         # 按队列存储延迟机制信息和队列状态
         self._delay_mechanisms: dict[str, dict] = {}
         self._declared_queues: set[str] = set()  # 已声明的队列缓存
+        
+        # 结果存储配置
+        self.result_store_url = result_store_url
+        self.result_store = None
+        self._init_result_store()
+
+    def _init_result_store(self) -> None:
+        """初始化结果存储"""
+        try:
+            from .result_storage.factory import create_result_store_from_settings
+            
+            self.result_store = create_result_store_from_settings(
+                store_url=self.result_store_url,
+                enabled=True  # Client 端默认启用查询
+            )
+            
+            if self.result_store:
+                from .result_storage.url_parser import parse_store_type_from_url
+                store_type = parse_store_type_from_url(self.result_store_url)
+                logger.info(f"客户端结果存储已初始化: {store_type} ({self.result_store_url})")
+            
+        except Exception as e:
+            logger.warning(f"初始化客户端结果存储失败: {e}")
+            logger.info("将无法查询任务结果")
 
     async def connect(self):
         """
@@ -152,10 +178,100 @@ class RabbitMQClient:
                     self.rabbitmq_settings.rabbitmq_url
                 )
 
+    async def get_job_result(self, job_id: str):
+        """获取单个任务结果
+        
+        Args:
+            job_id: 任务ID
+            
+        Returns:
+            JobResult 对象，如果不存在则返回 None
+            
+        Raises:
+            ValueError: 结果存储未初始化
+        """
+        if not self.result_store:
+            raise ValueError("结果存储未初始化，无法查询任务结果")
+        
+        return await self.result_store.get_result(job_id)
+    
+    async def get_job_results(self, job_ids: list[str]) -> dict[str, Any]:
+        """批量获取任务结果
+        
+        Args:
+            job_ids: 任务ID列表
+            
+        Returns:
+            任务ID到结果的映射字典
+            
+        Raises:
+            ValueError: 结果存储未初始化
+        """
+        if not self.result_store:
+            raise ValueError("结果存储未初始化，无法查询任务结果")
+        
+        return await self.result_store.get_results(job_ids)
+    
+    async def get_job_status(self, job_id: str):
+        """获取任务状态
+        
+        Args:
+            job_id: 任务ID
+            
+        Returns:
+            JobStatus 枚举值，如果不存在则返回 None
+            
+        Raises:
+            ValueError: 结果存储未初始化
+        """
+        if not self.result_store:
+            raise ValueError("结果存储未初始化，无法查询任务状态")
+        
+        return await self.result_store.get_status(job_id)
+    
+    async def delete_job_result(self, job_id: str) -> bool:
+        """删除任务结果
+        
+        Args:
+            job_id: 任务ID
+            
+        Returns:
+            删除成功返回 True，结果不存在返回 False
+            
+        Raises:
+            ValueError: 结果存储未初始化
+        """
+        if not self.result_store:
+            raise ValueError("结果存储未初始化，无法删除任务结果")
+        
+        return await self.result_store.delete_result(job_id)
+    
+    async def get_storage_stats(self) -> dict[str, Any]:
+        """获取存储统计信息
+        
+        Returns:
+            包含统计信息的字典
+            
+        Raises:
+            ValueError: 结果存储未初始化
+        """
+        if not self.result_store:
+            raise ValueError("结果存储未初始化，无法获取统计信息")
+        
+        return await self.result_store.get_stats()
+
     async def close(self):
         """
         关闭连接
         """
+        # 关闭结果存储连接
+        if self.result_store:
+            try:
+                await self.result_store.close()
+                logger.info("✅ 客户端结果存储连接已关闭")
+            except Exception as e:
+                logger.warning(f"⚠️ 关闭客户端结果存储时出错: {e}")
+        
         if self.connection and not self.connection.is_closed:
             try:
                 await self.connection.close()
@@ -379,17 +495,19 @@ class RabbitMQClient:
 
 
 async def create_client(
-        rabbitmq_settings: RabbitMQSettings | None = None
+        rabbitmq_settings: RabbitMQSettings | None = None,
+        result_store_url: str = "redis://localhost:6379/0"
 ) -> RabbitMQClient:
     """
     创建并连接客户端
     
     Args:
         rabbitmq_settings: RabbitMQ 连接配置
+        result_store_url: 结果存储URL，通过URL自动识别存储类型
         
     Returns:
         RabbitMQClient: 已连接的客户端实例
     """
-    client = RabbitMQClient(rabbitmq_settings)
+    client = RabbitMQClient(rabbitmq_settings, result_store_url)
     await client.connect()
     return client
