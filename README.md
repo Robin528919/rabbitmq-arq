@@ -6,6 +6,7 @@
 
 - 🚀 **高性能**: 支持 ≥5000 消息/秒的处理能力
 - 🎯 **简洁 API**: 类似 arq 的装饰器风格，易于使用
+- 💾 **结果存储**: 支持多种存储后端，URL自动识别存储类型
 - 🔧 **易于迁移**: 提供从现有 Consumer 迁移的工具
 - 🌐 **中文友好**: 支持中文日志输出
 - 🔄 **高可用**: 内置重试机制和错误处理
@@ -193,6 +194,197 @@ rabbitmq-arq validate-config -m myapp.workers:worker_settings
 ```
 
 ## 高级特性
+
+### 任务结果存储
+
+RabbitMQ-ARQ 支持将任务结果持久化存储，便于后续查询和监控。支持多种存储后端，通过 URL 自动识别存储类型：
+
+#### 配置存储后端
+
+```python
+from rabbitmq_arq import Worker, WorkerSettings, create_client
+from rabbitmq_arq.connections import RabbitMQSettings
+
+# Redis 存储配置（推荐）
+rabbitmq_settings = RabbitMQSettings(rabbitmq_url="amqp://localhost:5672")
+
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[your_tasks],
+    worker_name="result_storage_worker",
+    queue_name="default",
+    
+    # 任务结果存储配置
+    enable_job_result_storage=True,
+    job_result_store_url="redis://localhost:6379/0",  # 自动识别为 Redis
+    job_result_ttl=86400,  # 结果保存24小时
+)
+
+# 客户端配置（用于查询结果）
+client = await create_client(
+    rabbitmq_settings=rabbitmq_settings,
+    result_store_url="redis://localhost:6379/0"  # 与 Worker 使用相同的存储
+)
+```
+
+#### 支持的存储后端
+
+```python
+# Redis（推荐）
+"redis://localhost:6379/0"
+"rediss://user:pass@localhost:6380/1"  # Redis SSL
+
+# PostgreSQL
+"postgresql://user:pass@localhost:5432/dbname"
+"postgres://user:pass@localhost:5432/dbname"
+
+# MySQL
+"mysql://user:pass@localhost:3306/dbname"
+
+# MongoDB
+"mongodb://localhost:27017/dbname"
+
+# SQLite
+"sqlite:///path/to/database.db"
+
+# Amazon S3
+"s3://bucket-name/prefix"
+```
+
+#### 查询任务结果
+
+```python
+import asyncio
+from rabbitmq_arq import create_client, JobContext
+from rabbitmq_arq.connections import RabbitMQSettings
+
+# 示例任务函数
+async def data_processing_task(ctx: JobContext, data: dict) -> dict:
+    """数据处理任务，返回处理结果"""
+    await asyncio.sleep(1)  # 模拟处理时间
+    return {
+        "processed": True,
+        "input_count": len(data),
+        "result": f"processed_{data['id']}",
+        "timestamp": asyncio.get_event_loop().time()
+    }
+
+async def main():
+    # 创建客户端
+    settings = RabbitMQSettings(rabbitmq_url="amqp://localhost:5672")
+    client = await create_client(
+        rabbitmq_settings=settings,
+        result_store_url="redis://localhost:6379/0"
+    )
+    
+    try:
+        # 提交任务
+        job = await client.enqueue_job(
+            "data_processing_task",
+            data={"id": "test_001", "value": "sample_data"},
+            queue_name="default"
+        )
+        print(f"任务已提交: {job.job_id}")
+        
+        # 等待任务完成
+        await asyncio.sleep(5)
+        
+        # 查询任务结果
+        result = await client.get_job_result(job.job_id)
+        if result:
+            print(f"任务状态: {result.status}")
+            print(f"任务结果: {result.result}")
+            print(f"执行时长: {result.duration}秒")
+            print(f"执行者: {result.worker_id}")
+        else:
+            print("任务结果未找到")
+        
+        # 查询任务状态（更轻量）
+        status = await client.get_job_status(job.job_id)
+        print(f"当前状态: {status}")
+        
+        # 批量查询结果
+        batch_results = await client.get_job_results([job.job_id, "another_job_id"])
+        print(f"批量查询结果: {len(batch_results)} 个结果")
+        
+        # 获取存储统计
+        stats = await client.get_storage_stats()
+        print(f"存储统计: {stats}")
+        
+        # 删除任务结果
+        deleted = await client.delete_job_result(job.job_id)
+        print(f"结果删除成功: {deleted}")
+        
+    finally:
+        await client.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+#### 结果存储配置选项
+
+```python
+worker_settings = WorkerSettings(
+    # ... 其他配置 ...
+    
+    # 结果存储配置
+    enable_job_result_storage=True,  # 是否启用结果存储
+    job_result_store_url="redis://localhost:6379/0",  # 存储URL
+    job_result_ttl=86400,  # 结果过期时间（秒），默认24小时
+)
+```
+
+#### 存储的数据结构
+
+任务结果包含以下信息：
+
+```python
+{
+    "job_id": "abc123...",           # 任务ID
+    "status": "completed",           # 任务状态
+    "result": {...},                 # 任务返回结果
+    "error": null,                   # 错误信息（如果失败）
+    "start_time": "2025-01-15T10:30:00Z",  # 开始时间
+    "end_time": "2025-01-15T10:30:05Z",    # 结束时间
+    "duration": 5.2,                 # 执行时长（秒）
+    "worker_id": "worker_001",       # 执行的Worker ID
+    "queue_name": "default",         # 队列名称
+    "retry_count": 0,                # 重试次数
+    "function_name": "my_task",      # 函数名称
+    "args": [1, 2, 3],              # 函数参数
+    "kwargs": {"key": "value"},      # 函数关键字参数
+    "created_at": "2025-01-15T10:30:00Z",  # 创建时间
+    "expires_at": "2025-01-16T10:30:00Z"   # 过期时间
+}
+```
+
+#### 最佳实践
+
+1. **选择合适的存储后端**：
+   - 小规模部署：Redis（简单高效）
+   - 大规模部署：PostgreSQL（持久化可靠）
+   - 临时存储：内存（开发测试）
+
+2. **设置合理的TTL**：
+   ```python
+   # 短期任务（1小时）
+   job_result_ttl=3600
+   
+   # 中期任务（1天）
+   job_result_ttl=86400
+   
+   # 长期任务（1周）
+   job_result_ttl=604800
+   ```
+
+3. **监控存储使用**：
+   ```python
+   stats = await client.get_storage_stats()
+   print(f"存储类型: {stats['store_type']}")
+   print(f"总存储量: {stats['total_stored']}")
+   print(f"成功率: {stats['success_rate']:.2%}")
+   ```
 
 ### 错误处理和重试
 
@@ -584,6 +776,9 @@ mypy src
 - `ARQ_QUEUE_NAME`: 默认队列名称 (默认: `arq:queue`)
 - `ARQ_BURST_MODE`: 是否启用 Burst 模式 (默认: `False`)
 - `ARQ_BURST_TIMEOUT`: Burst 模式超时时间秒数 (默认: `300`)
+- `ARQ_RESULT_STORE_URL`: 任务结果存储URL (默认: `redis://localhost:6379/0`)
+- `ARQ_RESULT_STORE_TTL`: 结果存储TTL秒数 (默认: `86400`)
+- `ARQ_ENABLE_RESULT_STORAGE`: 是否启用结果存储 (默认: `true`)
 
 ### 配置文件
 
@@ -596,6 +791,10 @@ rabbitmq:
 worker:
   max_workers: 10
   queues: ["default", "high_priority"]
+  result_storage:
+    enabled: true
+    store_url: "redis://localhost:6379/0"
+    ttl: 86400  # 24小时
   
 logging:
   level: "INFO"
@@ -618,7 +817,55 @@ MIT License - 详见 [LICENSE](LICENSE) 文件。
 
 ## 更新日志
 
-### v0.1.0 (最新版本)
+### v0.2.0 (最新版本)
+
+**重大更新**:
+- 🔄 **任务结果存储重构**: 简化配置方式，从多参数配置改为URL配置
+- 🚀 **URL自动识别**: 通过URL自动识别存储类型（redis://、postgresql://等）
+- 🗑️ **移除内存存储**: 去除分布式环境下无用的内存存储选项
+- 🔧 **架构优化**: 重构Worker类继承结构，解决属性依赖问题
+
+**配置变更**:
+```python
+# 旧方式（已废弃）
+worker_settings = WorkerSettings(
+    job_result_store_type='redis',
+    job_result_store_config={'redis_url': 'redis://localhost:6379/0'}
+)
+
+# 新方式（推荐）
+worker_settings = WorkerSettings(
+    job_result_store_url='redis://localhost:6379/0'  # 自动识别为Redis
+)
+```
+
+**破坏性变更**:
+- 移除了 `job_result_store_type` 配置参数
+- 移除了 `job_result_store_config` 配置参数
+- 移除了内存存储后端支持
+- `create_client` 函数签名变更为URL配置
+
+**迁移指南**:
+```python
+# 如果你之前使用了结果存储，请按以下方式更新配置：
+
+# 旧配置
+worker_settings = WorkerSettings(
+    job_result_store_type='redis',
+    job_result_store_config={
+        'redis_url': 'redis://localhost:6379/0',
+        'key_prefix': 'my_app'
+    }
+)
+
+# 新配置
+worker_settings = WorkerSettings(
+    job_result_store_url='redis://localhost:6379/0'
+    # 注意：key_prefix 等高级配置现在通过URL参数传递
+)
+```
+
+### v0.1.0
 
 **核心功能**:
 - ✅ 基于 RabbitMQ 的异步任务队列实现
