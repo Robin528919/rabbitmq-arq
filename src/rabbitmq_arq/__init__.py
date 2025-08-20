@@ -25,7 +25,7 @@ from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine, StartupShutdown
 from .constants import default_queue_name
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # Worker
