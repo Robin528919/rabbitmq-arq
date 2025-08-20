@@ -171,8 +171,10 @@ class RedisResultStore(ResultStore):
             pipe.setex(result_key, ttl_seconds, result_data)
 
             # 存储状态索引（带TTL）
+            # 确保状态值是字符串（兼容枚举和字符串两种情况）
+            status_value = job_result.status.value if hasattr(job_result.status, 'value') else str(job_result.status)
             # noinspection PyAsyncCall
-            pipe.setex(status_key, ttl_seconds, job_result.status.value)
+            pipe.setex(status_key, ttl_seconds, status_value)
 
             # 添加到队列分组集合（带TTL）
             # noinspection PyAsyncCall
