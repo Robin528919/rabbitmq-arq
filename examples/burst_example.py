@@ -10,9 +10,11 @@ import logging
 from typing import Dict, Any
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.rabbitmq_arq import (
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rabbitmq_arq import (
     Worker,
     WorkerSettings,
     RabbitMQClient,

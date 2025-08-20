@@ -11,9 +11,10 @@ import os
 import sys
 from typing import Dict, Any
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.rabbitmq_arq import (
+from rabbitmq_arq import (
     Worker,
     WorkerSettings,
     RabbitMQClient,

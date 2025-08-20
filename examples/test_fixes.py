@@ -10,8 +10,15 @@ import logging
 from typing import Dict, Any
 import time
 
-from src.rabbitmq_arq import (
+import sys
+import os
+
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rabbitmq_arq import (
     Worker,
+    WorkerSettings,
     RabbitMQClient,
     RabbitMQSettings,
     JobContext,
@@ -31,17 +38,8 @@ task_logger = logging.getLogger('test_task')
 # 测试配置
 test_settings = RabbitMQSettings(
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="test_fixes_queue",
-    max_retries=3,
-    retry_backoff=3.0,
-    job_timeout=60,
     prefetch_count=5,
-    log_level="INFO",
-    # 启用 burst 模式进行测试
-    burst_mode=True,
-    burst_timeout=60,
-    burst_check_interval=1.0,
-    burst_wait_for_tasks=True
+    connection_timeout=30
 )
 
 

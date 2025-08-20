@@ -11,10 +11,13 @@ from datetime import datetime, timedelta
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.rabbitmq_arq import (
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rabbitmq_arq import (
     Worker,
+    WorkerSettings,
     RabbitMQClient,
     RabbitMQSettings,
     JobContext,
@@ -33,11 +36,8 @@ logger = logging.getLogger('test_client_delay')
 # 测试配置
 test_settings = RabbitMQSettings(
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="client_delay_test_queue",
-    max_retries=3,
-    retry_backoff=3.0,
-    burst_mode=True,
-    burst_timeout=60
+    prefetch_count=100,
+    connection_timeout=30
 )
 
 
@@ -82,11 +82,24 @@ async def test_shutdown(ctx):
 
 
 # Worker 设置
-class ClientDelayTestWorkerSettings:
-    functions = [immediate_task, client_delayed_task, retry_task]
-    rabbitmq_settings = test_settings
-    on_startup = test_startup
-    on_shutdown = test_shutdown
+client_delay_test_worker_settings = WorkerSettings(
+    rabbitmq_settings=test_settings,
+    functions=[immediate_task, client_delayed_task, retry_task],
+    worker_name="client_delay_test_worker",
+    queue_name="client_delay_test_queue",
+    dlq_name="client_delay_test_queue_dlq",
+    max_retries=3,
+    retry_backoff=3.0,
+    job_timeout=60,
+    max_concurrent_jobs=5,
+    burst_mode=True,
+    burst_timeout=60,
+    burst_check_interval=1.0,
+    burst_wait_for_tasks=True,
+    on_startup=test_startup,
+    on_shutdown=test_shutdown,
+    log_level="INFO"
+)
 
 
 async def submit_test_tasks():
@@ -102,7 +115,8 @@ async def submit_test_tasks():
         # 1. 提交立即执行任务
         immediate_job = await client.enqueue_job(
             "immediate_task",
-            "immediate_1"
+            "immediate_1",
+            queue_name="client_delay_test_queue"
         )
         logger.info(f"📤 已提交立即任务: {immediate_job.job_id}")
         
@@ -111,6 +125,7 @@ async def submit_test_tasks():
             "client_delayed_task",
             "delayed_1",
             "延迟5秒执行",
+            queue_name="client_delay_test_queue",
             _defer_by=5  # 5秒后执行
         )
         logger.info(f"📤 已提交5秒延迟任务: {delay_job1.job_id}")
@@ -120,6 +135,7 @@ async def submit_test_tasks():
             "client_delayed_task",
             "delayed_2", 
             "延迟10秒执行",
+            queue_name="client_delay_test_queue",
             _defer_by=10  # 10秒后执行
         )
         logger.info(f"📤 已提交10秒延迟任务: {delay_job2.job_id}")
@@ -127,7 +143,8 @@ async def submit_test_tasks():
         # 4. 提交需要重试的任务
         retry_job = await client.enqueue_job(
             "retry_task",
-            "retry_1"
+            "retry_1",
+            queue_name="client_delay_test_queue"
         )
         logger.info(f"📤 已提交重试测试任务: {retry_job.job_id}")
         
@@ -137,7 +154,8 @@ async def submit_test_tasks():
             "client_delayed_task",
             "future_1",
             f"延迟到 {future_time.strftime('%H:%M:%S')}",
-            _defer_until=future_time
+            queue_name="client_delay_test_queue",
+            defer_until=future_time
         )
         logger.info(f"📤 已提交未来时间任务: {future_job.job_id}")
         
@@ -153,16 +171,17 @@ async def submit_test_tasks():
 
 async def clear_queue():
     """清空测试队列"""
-    client = RabbitMQClient(test_settings)
+    from aio_pika import connect_robust
+    
     try:
-        await client.connect()
-        queue = await client.channel.get_queue(test_settings.rabbitmq_queue)
+        connection = await connect_robust(test_settings.rabbitmq_url)
+        channel = await connection.channel()
+        queue = await channel.declare_queue("client_delay_test_queue", durable=True)
         purged = await queue.purge()
         logger.info(f"🧹 已清空队列，删除了 {purged} 条消息")
+        await connection.close()
     except Exception as e:
         logger.error(f"❌ 清空队列失败: {e}")
-    finally:
-        await client.close()
 
 
 def main():
@@ -192,7 +211,8 @@ def main():
     elif command == "submit":
         asyncio.run(submit_test_tasks())
     elif command == "worker":
-        Worker.run(ClientDelayTestWorkerSettings)
+        worker = Worker(client_delay_test_worker_settings)
+        asyncio.run(worker.main())
     else:
         print(f"❌ 未知命令: {command}")
 

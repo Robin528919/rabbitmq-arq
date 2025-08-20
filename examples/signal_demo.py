@@ -12,11 +12,10 @@ import signal
 import sys
 from pathlib import Path
 
-# 添加 src 目录到 Python 路径
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rabbitmq_arq import Worker, WorkerSettings, RabbitMQSettings
-from rabbitmq_arq.models import JobContext
+from rabbitmq_arq import Worker, WorkerSettings, RabbitMQSettings, JobContext
 
 # 配置日志
 logging.basicConfig(
@@ -27,12 +26,9 @@ logger = logging.getLogger(__name__)
 
 # RabbitMQ 连接配置
 rabbitmq_settings = RabbitMQSettings(
-    host="localhost",
-    port=5672,
-    username="guest",
-    password="guest",
-    vhost="/",
-    prefetch_count=10
+    rabbitmq_url="amqp://guest:guest@localhost:5672/",
+    prefetch_count=10,
+    connection_timeout=30
 )
 
 async def simple_task(ctx: JobContext, message: str = "Hello"):

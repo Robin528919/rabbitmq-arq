@@ -9,8 +9,15 @@ import asyncio
 import logging
 from datetime import datetime
 
-from src.rabbitmq_arq import (
+import sys
+import os
+
+# 添加项目根目录到路径（用于开发环境）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from rabbitmq_arq import (
     Worker,
+    WorkerSettings,
     RabbitMQClient,
     RabbitMQSettings,
     JobContext,
@@ -29,11 +36,8 @@ logger = logging.getLogger('test_delay')
 # 测试配置
 test_settings = RabbitMQSettings(
     rabbitmq_url="amqp://guest:guest@localhost:5672/",
-    rabbitmq_queue="delay_test_queue",
-    max_retries=3,
-    retry_backoff=5.0,
-    burst_mode=True,
-    burst_timeout=120
+    prefetch_count=100,
+    connection_timeout=30
 )
 
 
