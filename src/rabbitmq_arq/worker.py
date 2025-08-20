@@ -570,6 +570,14 @@ class Worker(WorkerUtils):
         处理 RabbitMQ 消息的回调方法，包含重试和失败转死信队列逻辑。
         """
         job_id = None
+        
+        # 提前检查是否允许接收新任务，避免消息被process后再reject
+        if not self.allow_pick_jobs:
+            # 直接reject，不进入process上下文
+            await message.reject(requeue=True)
+            logger.warning(f"Worker 正在关闭，拒绝消息处理")
+            return
+            
         async with message.process(requeue=False):  # 禁用自动重入队，防止重复消费
             headers = message.headers or {}
             retry_count = headers.get("x-retry-count", 0)
@@ -579,12 +587,6 @@ class Worker(WorkerUtils):
                 job_data = json.loads(message.body.decode())
                 job = JobModel(**job_data)
                 job_id = job.job_id
-
-                # 检查是否允许接收新任务
-                if not self.allow_pick_jobs:
-                    logger.warning(f"Worker 正在关闭，拒绝任务: {job_id}")
-                    await message.reject(requeue=True)
-                    return
 
                 # 检查是否是客户端已处理的延迟任务
                 client_delayed = headers.get("x-client-delayed") == "true"
