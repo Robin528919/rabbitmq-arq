@@ -622,26 +622,26 @@ class Worker(WorkerUtils):
                     await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                     return
 
-                # 可重试的错误：检查重试次数
-                # retry_count 从消息头获取，表示已重试次数
-                # job_try 表示即将执行的次数（retry_count + 1）
-                if job_id and job:
-                    job.job_try = retry_count + 1
-
-                # 检查重试次数限制
+                # 可重试的错误：检查重试次数限制
                 if retry_count >= self.worker_settings.max_retries:
                     logger.error(f"任务 {job_id} 已达到最大重试次数 {self.worker_settings.max_retries}")
                     await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                     return
+
+                # 准备重试：递增重试计数
+                new_retry_count = retry_count + 1
+                if job_id and job:
+                    # 更新任务的尝试次数（用于下次执行）
+                    job.job_try = new_retry_count + 1  # job_try 从1开始，表示执行次数
 
                 # 计算退避时间（指数退避）
                 delay_seconds = self.worker_settings.retry_backoff * (2 ** retry_count)
 
                 # 发送到延迟队列进行重试
                 if job_id and job:
-                    await self._send_to_delay_queue(job, delay_seconds)
+                    await self._send_to_delay_queue(job, delay_seconds, new_retry_count)
                     logger.info(
-                        f"任务 {job_id} 第 {retry_count + 1} 次重试，延迟 {delay_seconds:.1f} 秒 (错误类型: {type(e).__name__}, 分类: {error_category})")
+                        f"任务 {job_id} 第 {new_retry_count} 次重试，延迟 {delay_seconds:.1f} 秒 (错误类型: {type(e).__name__}, 分类: {error_category})")
 
             finally:
                 # 从任务列表中移除
@@ -867,13 +867,14 @@ class Worker(WorkerUtils):
             routing_key=self.rabbitmq_dlq
         )
 
-    async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float) -> None:
+    async def _send_to_delay_queue(self, job: JobModel, delay_seconds: float, retry_count: int | None = None) -> None:
         """
         将任务发送到延迟队列，自动选择最佳延迟机制
         
         Args:
-            job: 任务模型（包含正确的 job_try 计数）
+            job: 任务模型
             delay_seconds: 延迟时间（秒）
+            retry_count: 重试计数（如果提供，则使用此值；否则从 job.job_try 计算）
         """
         # 清除延迟时间，避免循环延迟
         job.defer_until = None
@@ -881,10 +882,15 @@ class Worker(WorkerUtils):
         # 序列化任务
         message_body = json.dumps(job.model_dump(), ensure_ascii=False, default=str).encode()
 
-        # 统一重试计数逻辑：x-retry-count = job_try - 1
-        # job_try 表示执行次数（从1开始），retry_count 表示重试次数（从0开始）
-        retry_count = job.job_try - 1
-        headers = {"x-retry-count": retry_count}
+        # 确定重试计数
+        if retry_count is not None:
+            # 使用提供的重试计数
+            actual_retry_count = retry_count
+        else:
+            # 从 job_try 计算重试计数
+            actual_retry_count = job.job_try - 1 if job.job_try > 0 else 0
+            
+        headers = {"x-retry-count": actual_retry_count}
 
         if self._use_delayed_exchange:
             # 使用延迟插件（更优雅的方案）
@@ -904,7 +910,7 @@ class Worker(WorkerUtils):
                 routing_key=self.rabbitmq_queue
             )
 
-            logger.info(f"任务 {job.job_id} 已通过延迟交换机发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {retry_count})")
+            logger.info(f"任务 {job.job_id} 已通过延迟交换机发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {actual_retry_count})")
 
         else:
             # 使用 TTL + DLX 方案（降级方案）
