@@ -193,6 +193,21 @@ class ResultStore(ABC):
             self._logger.warning(f"健康检查失败: {e}")
             return False
     
+    @abstractmethod
+    async def validate_connection(self) -> bool:
+        """验证存储连接
+        
+        验证存储后端的连接是否可用，这是一个更轻量级的检查方法，
+        主要用于启动时验证配置和连接状态。
+        
+        Returns:
+            连接状态，True表示连接正常
+            
+        Raises:
+            ResultStoreConnectionError: 连接验证失败时抛出
+        """
+        pass
+    
     async def close(self) -> None:
         """关闭存储连接
         

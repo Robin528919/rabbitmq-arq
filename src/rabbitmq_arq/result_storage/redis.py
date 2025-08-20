@@ -462,6 +462,36 @@ class RedisResultStore(ResultStore):
             self._logger.warning(f"Redis健康检查失败: {e}")
             return False
 
+    async def validate_connection(self) -> bool:
+        """验证Redis连接
+        
+        Returns:
+            连接状态，True表示连接正常
+            
+        Raises:
+            ResultStoreConnectionError: 连接验证失败时抛出
+        """
+        try:
+            # 尝试建立连接（如果还没有建立）
+            redis_client = await self._get_redis()
+            
+            # 执行PING命令验证连接
+            pong = await redis_client.ping()
+            if not pong:
+                raise ResultStoreConnectionError("Redis PING 命令返回失败", "redis")
+            
+            self._logger.debug("Redis连接验证成功")
+            return True
+            
+        except ConnectionError as e:
+            raise ResultStoreConnectionError(f"Redis连接失败: {e}", "redis")
+        except TimeoutError as e:
+            raise ResultStoreConnectionError(f"Redis连接超时: {e}", "redis")
+        except RedisError as e:
+            raise ResultStoreConnectionError(f"Redis错误: {e}", "redis")
+        except Exception as e:
+            raise ResultStoreConnectionError(f"Redis连接验证异常: {e}", "redis")
+
     async def close(self) -> None:
         """关闭存储连接"""
         if self._redis:

@@ -181,17 +181,29 @@ def parse_storage_config(url: str) -> dict[str, Any]:
     """
     store_type = parse_store_type_from_url(url)
     
-    config = {'type': store_type, 'url': url}
+    # 分层配置策略：通用配置 + 存储特定配置
+    config = {
+        'type': store_type,
+        'url': url,  # 通用URL字段
+    }
     
-    # 根据存储类型解析具体配置
+    # 根据存储类型解析具体配置并添加存储特定的URL字段
     if store_type == 'redis':
-        config.update(parse_redis_url(url))
+        redis_config = parse_redis_url(url)
+        config.update(redis_config)
+        config['redis_url'] = url  # Redis特定URL字段
     elif store_type == 'database':
-        config.update(parse_database_url(url))
+        db_config = parse_database_url(url)
+        config.update(db_config)
+        # database保持url字段（已在parse_database_url中设置）
     elif store_type == 'mongodb':
-        config.update(parse_mongodb_url(url))
+        mongo_config = parse_mongodb_url(url)
+        config.update(mongo_config)
+        # mongodb保持url字段（已在parse_mongodb_url中设置）
     elif store_type == 's3':
-        config.update(parse_s3_url(url))
+        s3_config = parse_s3_url(url)
+        config.update(s3_config)
+        config['s3_url'] = url  # S3特定URL字段
     # 其他存储类型可以继续扩展
     
     return config

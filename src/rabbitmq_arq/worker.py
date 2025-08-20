@@ -25,7 +25,10 @@ from .connections import WorkerSettings
 from .exceptions import Retry, JobTimeout, MaxRetriesExceeded, RabbitMQConnectionError
 from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine
+from .result_storage import ResultStore
 from .result_storage.factory import create_result_store_from_settings
+from .result_storage.models import JobResult
+from .result_storage.url_parser import parse_store_type_from_url
 
 logger = logging.getLogger('rabbitmq-arq.worker')
 
@@ -113,7 +116,7 @@ class WorkerUtils:
     消费者工具类 - 基础属性和信号处理
     """
 
-    def __init__(self, worker_settings=None):
+    def __init__(self, worker_settings: WorkerSettings | None = None):
         self.allow_pick_jobs = True
         self.tasks: dict[str, asyncio.Task] = {}
         self.main_task: asyncio.Task | None = None
@@ -392,8 +395,6 @@ class Worker(WorkerUtils):
         self.functions = {fn.__name__: fn for fn in worker_settings.functions}
         self.consuming = False
 
-        # 统一使用父类的 self.tasks 字典进行任务管理，不再需要 tasks_running
-
         # 生命周期钩子
         self.on_startup = worker_settings.on_startup
         self.on_shutdown = worker_settings.on_shutdown
@@ -431,31 +432,49 @@ class Worker(WorkerUtils):
         self._queue = None
 
         # 结果存储初始化
-        self.result_store = None
+        self.result_store: ResultStore | None = None
         self._init_result_store()
 
         # 信号处理器将在 main() 方法中设置，因为此时事件循环还没有运行
 
     def _init_result_store(self) -> None:
         """初始化结果存储"""
-        if not self.worker_settings.enable_job_result_storage:
-            logger.info("任务结果存储已禁用")
-            return
         try:
             self.result_store = create_result_store_from_settings(
                 store_url=self.worker_settings.job_result_store_url,
-                enabled=self.worker_settings.enable_job_result_storage,
                 ttl=self.worker_settings.job_result_ttl
             )
 
             if self.result_store:
-                from .result_storage.url_parser import parse_store_type_from_url
                 store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
                 logger.info(f"任务结果存储已初始化: {store_type} ({self.worker_settings.job_result_store_url})")
 
         except Exception as e:
             logger.error(f"初始化结果存储失败: {e}")
             logger.info("将在不存储结果的情况下继续运行")
+    
+    async def _validate_result_store(self) -> None:
+        """验证结果存储连接"""
+        if not self.result_store:
+            logger.error("⚠️ 未配置结果存储，任务结果将不会被保存")
+            raise RuntimeError("结果存储未配置")
+        
+        try:
+            # 调用存储对象的连接验证方法
+            is_valid = await self.result_store.validate_connection()
+            if is_valid:
+                store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
+                logger.info(f"✅ 结果存储连接验证成功: {store_type}")
+            else:
+                store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
+                raise ValueError(f"结果存储连接验证失败: {store_type}")
+                
+        except Exception as e:
+            store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
+            logger.error(f"❌ 结果存储连接验证失败 ({store_type}): {e}")
+            
+            # 直接抛出异常，这是严重错误 - 简化错误信息避免重复
+            raise RuntimeError(f"结果存储 ({store_type}) 连接失败，Worker 无法启动") from e
 
     async def _store_job_result(self, job: JobModel) -> None:
         """存储任务结果
@@ -463,11 +482,11 @@ class Worker(WorkerUtils):
         Args:
             job: 任务模型，包含执行结果和元数据
         """
+        # 检查结果存储是否可用
         if not self.result_store:
-            return  # 结果存储未启用或初始化失败
+            return  # 结果存储未启用、初始化失败或连接不可用
 
         try:
-            from .result_storage.models import JobResult
 
             # 构建结果对象
             job_result = JobResult(
@@ -491,7 +510,7 @@ class Worker(WorkerUtils):
             logger.debug(f"任务结果已存储: {job.job_id} - {job.status}")
 
         except Exception as e:
-            # 存储失败不应影响任务处理流程
+            # 存储失败不应影响任务处理流程，但标记存储为不可用避免重复报错
             logger.warning(f"存储任务结果失败 {job.job_id}: {e}")
 
     def _setup_signal_handlers(self) -> None:
@@ -1154,6 +1173,7 @@ class Worker(WorkerUtils):
         start_time = datetime.now()
 
         try:
+
             # 设置信号处理器（事件循环已经在运行）
             self._setup_signal_handlers()
 
@@ -1162,14 +1182,16 @@ class Worker(WorkerUtils):
                 logger.info(f"🚀 启动 Burst 模式 Worker (超时: {self.worker_settings.burst_timeout}s)")
             else:
                 logger.info("🚀 启动常规模式 Worker")
+            # 初始化连接
+            await self._init()
+
+            # 验证结果存储连接
+            await self._validate_result_store()
 
             # 启动钩子
             if self.on_startup:
                 logger.info("执行启动钩子")
                 await self.on_startup(self.ctx)
-
-            # 初始化连接
-            await self._init()
 
             # 记录主任务
             self.main_task = asyncio.current_task()

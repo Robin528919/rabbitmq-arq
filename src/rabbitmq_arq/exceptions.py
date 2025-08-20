@@ -165,4 +165,24 @@ class RabbitMQConnectionError(RabbitMQArqException):
             full_message = "RabbitMQ 连接错误"
         
         super().__init__(full_message)
-        self.url = url 
+        self.url = url
+
+
+class ConnectionLost(RabbitMQConnectionError):
+    """连接丢失异常"""
+    pass
+
+
+class ResultNotFound(JobException):
+    """任务结果不存在异常 - 模仿ARQ库"""
+    
+    def __init__(self, message: str | None = None, job_id: str | None = None) -> None:
+        if message:
+            full_message = message
+        elif job_id:
+            full_message = f"任务 {job_id} 的结果不存在或已过期"
+        else:
+            full_message = "任务结果不存在或已过期"
+        
+        super().__init__(full_message)
+        self.job_id = job_id 

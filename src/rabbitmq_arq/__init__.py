@@ -6,7 +6,7 @@
 # @desc           : RabbitMQ-ARQ - 基于 RabbitMQ 的异步任务队列库
 
 from .worker import Worker, WorkerSettings
-from .client import RabbitMQClient, create_client
+from .client import RabbitMQClient
 from .connections import RabbitMQSettings
 from .exceptions import (
     Retry,
@@ -19,8 +19,10 @@ from .exceptions import (
     ConfigurationError,
     RabbitMQConnectionError,
     RabbitMQArqException,
-    JobException
+    JobException,
+    ResultNotFound
 )
+from .job import Job
 from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine, StartupShutdown
 from .constants import default_queue_name
@@ -34,7 +36,9 @@ __all__ = [
     
     # Client
     "RabbitMQClient",
-    "create_client",
+
+    # Job
+    "Job",
     
     # Settings
     "RabbitMQSettings",
@@ -57,6 +61,7 @@ __all__ = [
     "RabbitMQConnectionError",
     "RabbitMQArqException",
     "JobException",
+    "ResultNotFound",
     
     # Types
     "WorkerCoroutine",

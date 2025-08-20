@@ -17,6 +17,7 @@ from aio_pika import connect_robust, Message, RobustConnection, Channel
 
 from .connections import RabbitMQSettings
 from .exceptions import SerializationError, RabbitMQConnectionError
+from .job import Job
 from .models import JobModel, JobStatus
 
 # 获取日志记录器
@@ -33,8 +34,11 @@ class RabbitMQClient:
     每个队列支持独立的延迟机制检测和配置。
     """
 
-    def __init__(self, rabbitmq_settings: RabbitMQSettings | None = None,
-                 result_store_url: str = "redis://localhost:6379/0") -> None:
+    def __init__(
+            self,
+            rabbitmq_settings: RabbitMQSettings | None = None,
+            result_store_url: str = "redis://localhost:6379/0"
+    ) -> None:
         """
         初始化客户端
         
@@ -49,7 +53,7 @@ class RabbitMQClient:
         # 按队列存储延迟机制信息和队列状态
         self._delay_mechanisms: dict[str, dict] = {}
         self._declared_queues: set[str] = set()  # 已声明的队列缓存
-        
+
         # 结果存储配置
         self.result_store_url = result_store_url
         self.result_store = None
@@ -59,17 +63,17 @@ class RabbitMQClient:
         """初始化结果存储"""
         try:
             from .result_storage.factory import create_result_store_from_settings
-            
+
             self.result_store = create_result_store_from_settings(
                 store_url=self.result_store_url,
                 enabled=True  # Client 端默认启用查询
             )
-            
+
             if self.result_store:
                 from .result_storage.url_parser import parse_store_type_from_url
                 store_type = parse_store_type_from_url(self.result_store_url)
                 logger.info(f"客户端结果存储已初始化: {store_type} ({self.result_store_url})")
-            
+
         except Exception as e:
             logger.warning(f"初始化客户端结果存储失败: {e}")
             logger.info("将无法查询任务结果")
@@ -170,7 +174,7 @@ class RabbitMQClient:
                     "delay_queue_name": delay_queue_name,
                     "detected": True
                 }
-                
+
             except Exception as dlx_error:
                 logger.error(f"❌ 队列 {queue_name} TTL + DLX 方案配置失败: {dlx_error}")
                 raise RabbitMQConnectionError(
@@ -192,9 +196,9 @@ class RabbitMQClient:
         """
         if not self.result_store:
             raise ValueError("结果存储未初始化，无法查询任务结果")
-        
+
         return await self.result_store.get_result(job_id)
-    
+
     async def get_job_results(self, job_ids: list[str]) -> dict[str, Any]:
         """批量获取任务结果
         
@@ -209,9 +213,9 @@ class RabbitMQClient:
         """
         if not self.result_store:
             raise ValueError("结果存储未初始化，无法查询任务结果")
-        
+
         return await self.result_store.get_results(job_ids)
-    
+
     async def get_job_status(self, job_id: str):
         """获取任务状态
         
@@ -226,9 +230,9 @@ class RabbitMQClient:
         """
         if not self.result_store:
             raise ValueError("结果存储未初始化，无法查询任务状态")
-        
+
         return await self.result_store.get_status(job_id)
-    
+
     async def delete_job_result(self, job_id: str) -> bool:
         """删除任务结果
         
@@ -243,9 +247,9 @@ class RabbitMQClient:
         """
         if not self.result_store:
             raise ValueError("结果存储未初始化，无法删除任务结果")
-        
+
         return await self.result_store.delete_result(job_id)
-    
+
     async def get_storage_stats(self) -> dict[str, Any]:
         """获取存储统计信息
         
@@ -257,8 +261,35 @@ class RabbitMQClient:
         """
         if not self.result_store:
             raise ValueError("结果存储未初始化，无法获取统计信息")
-        
+
         return await self.result_store.get_stats()
+
+    def get_job(self, job_id: str) -> Job:
+        """
+        获取Job对象 - ARQ风格API
+        
+        Args:
+            job_id: 任务ID
+            
+        Returns:
+            Job对象，用于查询任务状态和结果
+            
+        Example:
+            ```python
+            # 获取任务对象
+            job = client.get_job('job_id_123')
+            
+            # 查询任务状态
+            status = await job.status()
+            
+            # 获取任务结果
+            result = await job.result()
+            
+            # 获取任务完整信息
+            info = await job.info()
+            ```
+        """
+        return Job(job_id=job_id, result_store=self.result_store)
 
     async def close(self):
         """
@@ -271,7 +302,7 @@ class RabbitMQClient:
                 logger.info("✅ 客户端结果存储连接已关闭")
             except Exception as e:
                 logger.warning(f"⚠️ 关闭客户端结果存储时出错: {e}")
-        
+
         if self.connection and not self.connection.is_closed:
             try:
                 await self.connection.close()
@@ -293,7 +324,7 @@ class RabbitMQClient:
             _expires: int | float | timedelta | None = None,
             _job_try: int | None = None,
             **kwargs
-    ) -> JobModel:
+    ) -> Job:
         """
         提交任务到队列
         
@@ -390,7 +421,8 @@ class RabbitMQClient:
             )
             logger.info(f"📤 任务已提交: {job.job_id} -> {queue_name}")
 
-        return job
+        # 返回Job对象而不是JobModel
+        return Job(job_id=job.job_id, result_store=self.result_store)
 
     async def _send_delayed_job(self, message_body: bytes, queue_name: str, delay_seconds: float, headers: dict | None = None):
         """
@@ -492,22 +524,3 @@ class RabbitMQClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """异步上下文管理器出口"""
         await self.close()
-
-
-async def create_client(
-        rabbitmq_settings: RabbitMQSettings | None = None,
-        result_store_url: str = "redis://localhost:6379/0"
-) -> RabbitMQClient:
-    """
-    创建并连接客户端
-    
-    Args:
-        rabbitmq_settings: RabbitMQ 连接配置
-        result_store_url: 结果存储URL，通过URL自动识别存储类型
-        
-    Returns:
-        RabbitMQClient: 已连接的客户端实例
-    """
-    client = RabbitMQClient(rabbitmq_settings, result_store_url)
-    await client.connect()
-    return client

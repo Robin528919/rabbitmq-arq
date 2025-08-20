@@ -81,7 +81,6 @@ except ImportError:
 
 def create_result_store_from_settings(
         store_url: str = "redis://localhost:6379/0",
-        enabled: bool = True,
         ttl: int = 86400,
         **kwargs: Any
 ) -> ResultStore | None:
@@ -91,16 +90,12 @@ def create_result_store_from_settings(
     
     Args:
         store_url: 存储URL，通过URL自动识别存储类型
-        enabled: 是否启用存储
         ttl: 结果过期时间（秒）
         **kwargs: 其他配置参数
         
     Returns:
         存储实例，如果 enabled=False 则返回 None
     """
-    if not enabled:
-        logger.info("结果存储已禁用")
-        return None
 
     if not store_url:
         logger.warning("存储URL为空，禁用结果存储")
