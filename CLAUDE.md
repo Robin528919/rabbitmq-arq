@@ -110,6 +110,16 @@ pip install -e ".[dev]"
 - **配置管理**: 使用 Pydantic 配置类（`WorkerSettings`、`RabbitMQSettings`）进行配置管理
 - **任务生命周期**: 任务状态流程：pending → running → completed/failed，失败任务具有重试逻辑
 - **连接管理**: 强健的连接处理，支持自动重连和连接池
+- **结果存储**: 支持多种存储后端（内存、Redis），用于持久化任务结果和状态查询
+
+### Redis 存储规则
+- **依赖管理**: 使用 `redis>=4.5.0` 包，该包已集成异步 Redis 客户端，无需额外安装 `aioredis`
+- **连接模式**: 使用 `redis.asyncio` 模块进行异步操作，而非过时的 `aioredis` 包
+- **连接池**: 必须使用连接池模式，通过 `redis.asyncio.ConnectionPool` 管理连接
+- **键命名策略**: 使用统一的键前缀和命名规范，例如 `{prefix}:result:{job_id}`
+- **TTL 管理**: 所有存储的键必须设置合理的过期时间，避免内存泄漏
+- **原子操作**: 使用 Redis 管道 (pipeline) 确保多键操作的原子性
+- **错误处理**: 优雅处理 Redis 连接错误，存储失败不应影响任务执行流程
 
 ### 任务定义模式
 任务函数必须接收 `JobContext` 作为第一个参数：
@@ -161,12 +171,18 @@ worker = Worker(worker_settings)
 ### 必需服务
 - **RabbitMQ**: 核心消息代理（通常在 Docker 中运行：`docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management`）
 
+### 可选服务
+- **Redis**: 任务结果存储（如果启用Redis存储）：`docker run -d --name redis -p 6379:6379 redis:7-alpine`
+
 ### 关键 Python 依赖
 - `aio-pika>=9.0.0`: 高性能异步 RabbitMQ 客户端
 - `pydantic>=2.0.0`: 数据验证和配置管理
 - `click>=8.0.0`: 命令行接口框架
 - `asyncio`: Python 原生异步 I/O 支持
 - `typing`: 现代类型注解支持
+
+### 可选 Python 依赖
+- `redis>=4.5.0`: Redis 异步客户端，用于任务结果存储（包含 asyncio 支持）
 
 ### 开发依赖
 - `pytest>=7.0.0`: 测试框架
