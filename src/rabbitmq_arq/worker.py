@@ -37,7 +37,16 @@ logger = logging.getLogger('rabbitmq-arq.worker')
 class ErrorClassification:
     """错误分类配置，用于智能重试策略"""
 
-    # 不可重试的错误类型（立即失败）
+    # 可重试的错误类型（仅限系统级错误和显式重试）
+    RETRIABLE_ERRORS = (
+        RabbitMQConnectionError,  # RabbitMQ 连接错误
+        TimeoutError,  # 超时错误
+        OSError,  # 操作系统错误
+        IOError,  # IO错误
+        Retry,  # 显式重试请求（ARQ 风格）
+    )
+
+    # 不可重试的错误类型（包括所有其他异常）
     NON_RETRIABLE_ERRORS = (
         TypeError,  # 函数签名错误、参数类型错误
         ValueError,  # 参数值错误
@@ -48,26 +57,13 @@ class ErrorClassification:
         NameError,  # 名称错误
         KeyError,  # 字典键错误（配置相关）
         MaxRetriesExceeded,  # 已达到最大重试次数
-    )
-
-    # 可重试的错误类型
-    RETRIABLE_ERRORS = (
-        RabbitMQConnectionError,  # RabbitMQ 连接错误
-        TimeoutError,  # 超时错误
-        OSError,  # 操作系统错误
-        IOError,  # IO错误
-        Retry,  # 显式重试请求
-    )
-
-    # 特殊处理：业务异常（需要检查重试次数）
-    BUSINESS_ERRORS = (
-        Exception,  # 一般业务异常，需要根据重试次数决定
+        Exception,  # 所有其他异常都不自动重试（ARQ 风格）
     )
 
     @classmethod
     def is_retriable_error(cls, error: Exception) -> bool:
         """
-        判断错误是否可重试
+        判断错误是否可重试（ARQ 风格）
         
         Args:
             error: 异常对象
@@ -75,25 +71,17 @@ class ErrorClassification:
         Returns:
             True 如果错误可重试，False 如果应立即失败
         """
-        # 显式不可重试的错误
-        if isinstance(error, cls.NON_RETRIABLE_ERRORS):
-            return False
-
-        # 显式可重试的错误  
+        # 显式可重试的错误（主要是系统级错误和 Retry 异常）
         if isinstance(error, cls.RETRIABLE_ERRORS):
             return True
 
-        # 业务异常：需要进一步检查重试次数
-        if isinstance(error, cls.BUSINESS_ERRORS):
-            return True
-
-        # 其他未知异常：默认不可重试（更保守的策略）
+        # 所有其他异常都不可重试（ARQ 风格）
         return False
 
     @classmethod
     def get_error_category(cls, error: Exception) -> str:
         """
-        获取错误分类
+        获取错误分类（ARQ 风格）
         
         Args:
             error: 异常对象
@@ -101,14 +89,10 @@ class ErrorClassification:
         Returns:
             错误分类字符串
         """
-        if isinstance(error, cls.NON_RETRIABLE_ERRORS):
-            return "non_retriable"
-        elif isinstance(error, cls.RETRIABLE_ERRORS):
+        if isinstance(error, cls.RETRIABLE_ERRORS):
             return "retriable"
-        elif isinstance(error, cls.BUSINESS_ERRORS):
-            return "business_retriable"
         else:
-            return "unknown_non_retriable"
+            return "non_retriable"
 
 
 class WorkerUtils:
@@ -564,6 +548,19 @@ class Worker(WorkerUtils):
         await self._setup_delay_mechanism()
 
         logger.info(f"成功连接到 RabbitMQ，队列: {self.rabbitmq_queue}")
+        
+        # 输出订阅的队列信息
+        logger.info(f"📋 订阅队列: {self.rabbitmq_queue}")
+        logger.info(f"💀 死信队列: {self.rabbitmq_dlq}")
+        if hasattr(self, '_delay_queue_name'):
+            logger.info(f"⏰ 延迟队列: {self._delay_queue_name}")
+        
+        # 输出注册的函数列表
+        if self.worker_settings.functions:
+            function_names = [func.__name__ for func in self.worker_settings.functions]
+            logger.info(f"🔧 注册函数: {', '.join(function_names)}")
+        else:
+            logger.info("⚠️ 未注册任何函数")
 
     async def on_message(self, message: IncomingMessage) -> None:
         """
@@ -616,31 +613,23 @@ class Worker(WorkerUtils):
             except Exception as e:
                 logger.error(f"处理消息时发生错误: {e}\n{traceback.format_exc()}")
 
-                # 智能错误处理
+                # ARQ 风格错误处理
                 error_category = ErrorClassification.get_error_category(e)
 
-                # 1. 不可重试的错误：立即发送到死信队列
+                # 不可重试的错误：立即发送到死信队列
                 if not ErrorClassification.is_retriable_error(e):
                     logger.error(f"任务 {job_id} 遇到不可重试错误 ({error_category}): {type(e).__name__}: {e}")
                     await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                     return
 
-                # 2. 业务异常：检查重试次数
-                if error_category == "business_retriable":
-                    # 业务异常需要检查重试次数
-                    if retry_count >= self.worker_settings.max_retries:
-                        logger.error(f"任务 {job_id} 业务异常已达到最大重试次数 {self.worker_settings.max_retries}: {type(e).__name__}: {e}")
-                        await self._send_to_dlq_with_error(message.body, headers, e, job_id)
-                        return
-
-                # 3. 可重试的错误：统一重试计数逻辑
+                # 可重试的错误：检查重试次数
                 # retry_count 从消息头获取，表示已重试次数
                 # job_try 表示即将执行的次数（retry_count + 1）
                 if job_id and job:
                     job.job_try = retry_count + 1
 
-                # 最终检查重试次数（双重保险）
-                if job.job_try >= self.worker_settings.max_retries:
+                # 检查重试次数限制
+                if retry_count >= self.worker_settings.max_retries:
                     logger.error(f"任务 {job_id} 已达到最大重试次数 {self.worker_settings.max_retries}")
                     await self._send_to_dlq_with_error(message.body, headers, e, job_id)
                     return
@@ -694,6 +683,9 @@ class Worker(WorkerUtils):
             # 获取要执行的函数
             func = self.functions_map.get(job.function)  # type: WorkerCoroutine
             if not func:
+                logger.error(f"未找到函数: {job.function}")
+                logger.error(f"可用函数列表: {list(self.functions_map.keys())}")
+                logger.error(f"functions_map 类型: {type(self.functions_map)}")
                 raise ValueError(f"未找到函数: {job.function}")
 
             # 执行函数（带超时控制）
