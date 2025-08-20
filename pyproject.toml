@@ -4,17 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rabbitmq_arq"
-version = "0.1.2"
+version = "0.2.0"
 description = "一个基于RabbitMQ的任务队列库，提供类似arq的简洁API"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "RabbitMQ-ARQ Team", email = "robin528919@gmail.com"}
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -23,12 +22,15 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",
+    "Framework :: AsyncIO",
+    "Operating System :: OS Independent",
 ]
 requires-python = ">=3.8"
 dependencies = [
     "aio-pika>=9.0.0",
     "pydantic>=2.0.0",
     "click>=8.0.0",
+    "redis>=4.5.0",  # 默认结果存储后端
 ]
 
 [project.optional-dependencies]
@@ -42,12 +44,26 @@ dev = [
     "mypy>=1.5.0",
     "pre-commit>=3.0.0",
 ]
-redis = [
-    "redis>=4.5.0",
-]
+# 存储后端可选依赖（部分为未来版本计划支持）
 mongodb = [
+    "pymongo>=4.3.0",          # 未来版本支持
+    "motor>=3.2.0",             # 未来版本支持
+]
+database = [
+    "asyncpg>=0.28.0",          # PostgreSQL (未来版本支持)
+    "aiomysql>=0.2.0",          # MySQL (未来版本支持)
+    "aiosqlite>=0.19.0",        # SQLite (未来版本支持)
+]
+s3 = [
+    "aioboto3>=11.0.0",         # Amazon S3 (未来版本支持)
+]
+all = [
     "pymongo>=4.3.0",
     "motor>=3.2.0",
+    "asyncpg>=0.28.0",
+    "aiomysql>=0.2.0", 
+    "aiosqlite>=0.19.0",
+    "aioboto3>=11.0.0",
 ]
 
 [project.urls]
@@ -57,7 +73,7 @@ Documentation = "https://github.com/Robin528919/rabbitmq-mq#readme"
 "Bug Tracker" = "https://github.com/Robin528919/rabbitmq-mq/issues"
 
 [project.scripts]
-rabbitmq_arq = "rabbitmq_arq.cli:main"
+rabbitmq-arq = "rabbitmq_arq.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
