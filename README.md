@@ -6,7 +6,7 @@
 
 - 🚀 **高性能**: 支持 ≥5000 消息/秒的处理能力
 - 🎯 **简洁 API**: 类似 arq 的装饰器风格，易于使用
-- 💾 **结果存储**: 支持多种存储后端，URL自动识别存储类型
+- 💾 **结果存储**: Redis存储后端，URL自动识别配置
 - 🔧 **易于迁移**: 提供从现有 Consumer 迁移的工具
 - 🌐 **中文友好**: 支持中文日志输出
 - 🔄 **高可用**: 内置重试机制和错误处理
@@ -17,8 +17,19 @@
 ### 安装
 
 ```bash
+# 基础安装（包含Redis支持）
 pip install rabbitmq-arq
+
+# 安装所有存储后端依赖（为未来版本做准备）
+pip install "rabbitmq-arq[all]"
+
+# 安装特定存储后端依赖
+pip install "rabbitmq-arq[mongodb]"    # MongoDB（计划支持）
+pip install "rabbitmq-arq[database]"   # 数据库支持（计划支持）
+pip install "rabbitmq-arq[s3]"         # S3支持（计划支持）
 ```
+
+> **注意**：当前版本只有Redis存储后端可用。其他存储后端的依赖包已预先配置，但功能将在未来版本中实现。
 
 ### 基本使用
 
@@ -197,7 +208,7 @@ rabbitmq-arq validate-config -m myapp.workers:worker_settings
 
 ### 任务结果存储
 
-RabbitMQ-ARQ 支持将任务结果持久化存储，便于后续查询和监控。支持多种存储后端，通过 URL 自动识别存储类型：
+RabbitMQ-ARQ 支持将任务结果持久化存储到Redis，便于后续查询和监控。通过 URL 自动识别Redis配置：
 
 #### 配置存储后端
 
@@ -229,27 +240,29 @@ client = await create_client(
 
 #### 支持的存储后端
 
+**当前支持（v0.2.0）**：
 ```python
-# Redis（推荐）
+# Redis（推荐，生产就绪）
 "redis://localhost:6379/0"
 "rediss://user:pass@localhost:6380/1"  # Redis SSL
+```
 
-# PostgreSQL
+**计划支持（未来版本）**：
+```python
+# 关系型数据库（计划中）
 "postgresql://user:pass@localhost:5432/dbname"
 "postgres://user:pass@localhost:5432/dbname"
-
-# MySQL
 "mysql://user:pass@localhost:3306/dbname"
-
-# MongoDB
-"mongodb://localhost:27017/dbname"
-
-# SQLite
 "sqlite:///path/to/database.db"
 
-# Amazon S3
-"s3://bucket-name/prefix"
+# NoSQL 数据库（计划中）
+"mongodb://localhost:27017/dbname"
+
+# 云存储（计划中）
+"s3://bucket-name/prefix"  # Amazon S3
 ```
+
+> **注意**：当前版本（v0.2.0）只实现了Redis存储后端。其他存储后端将在后续版本中逐步添加。如果您需要其他存储后端支持，请在 [GitHub Issues](https://github.com/Robin528919/rabbitmq-mq/issues) 中提出需求。
 
 #### 查询任务结果
 
@@ -361,10 +374,10 @@ worker_settings = WorkerSettings(
 
 #### 最佳实践
 
-1. **选择合适的存储后端**：
-   - 小规模部署：Redis（简单高效）
-   - 大规模部署：PostgreSQL（持久化可靠）
-   - 临时存储：内存（开发测试）
+1. **Redis存储配置**：
+   - 开发环境：使用本地Redis实例 `redis://localhost:6379/0`
+   - 生产环境：使用Redis集群或哨兵模式 `redis://user:pass@redis-cluster:6379/0`
+   - 安全连接：使用SSL加密 `rediss://user:pass@redis.example.com:6380/0`
 
 2. **设置合理的TTL**：
    ```python
@@ -821,7 +834,7 @@ MIT License - 详见 [LICENSE](LICENSE) 文件。
 
 **重大更新**:
 - 🔄 **任务结果存储重构**: 简化配置方式，从多参数配置改为URL配置
-- 🚀 **URL自动识别**: 通过URL自动识别存储类型（redis://、postgresql://等）
+- 🚀 **URL自动识别**: 通过URL自动识别Redis配置（redis://、rediss://）
 - 🗑️ **移除内存存储**: 去除分布式环境下无用的内存存储选项
 - 🔧 **架构优化**: 重构Worker类继承结构，解决属性依赖问题
 
