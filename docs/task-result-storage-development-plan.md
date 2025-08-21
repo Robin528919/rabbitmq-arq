@@ -6,19 +6,34 @@
 
 ## 当前状况分析
 
-### 存在的问题
-1. **结果未持久化**：任务结果只存储在内存中的 `JobModel.result` 字段，处理完成后立即丢失
-2. **无法查询历史结果**：客户端无法查询已完成任务的执行结果和状态
-3. **配置未实现**：`WorkerSettings` 中已有 `enable_job_result_storage` 和 `job_result_ttl` 配置，但未实现具体逻辑
-4. **缺乏结果管理**：没有结果过期清理、批量查询等管理功能
-5. **状态管理不完整**：任务状态变更缺乏完整的生命周期管理和持久化
-6. **实时状态查询缺失**：无法实时查询任务的当前执行状态和进度
+### 当前实现状态
 
-### 现有相关代码
-- `src/rabbitmq_arq/models.py:41`：`JobModel.result` 字段定义
-- `src/rabbitmq_arq/worker.py:632`：任务结果设置逻辑
-- `src/rabbitmq_arq/connections.py:148-149`：结果存储配置项
-- `src/rabbitmq_arq/connections.py:259-260`：配置参数赋值
+✅ **已完成的功能**：
+1. **基础架构**：完整的结果存储抽象层和接口定义
+2. **Redis存储**：高性能Redis结果存储后端实现
+3. **URL配置**：基于URL scheme的自动存储类型识别
+4. **Worker集成**：任务执行完成后自动存储结果
+5. **Client查询**：支持单个和批量结果查询API
+6. **工厂模式**：存储后端的自动创建和配置
+
+🚧 **待完善的功能**：
+1. **扩展存储后端**：数据库、NoSQL、云存储等其他存储方案
+2. **高级查询**：按时间范围、状态筛选、分页查询等
+3. **监控指标**：详细的存储性能和错误统计
+4. **运维工具**：清理过期数据、迁移工具等
+5. **混合存储**：分层存储和多后端并行写入
+
+### 已实现的核心代码
+- `src/rabbitmq_arq/result_storage/`：完整的结果存储模块
+- `src/rabbitmq_arq/result_storage/models.py`：JobResult数据模型和配置类
+- `src/rabbitmq_arq/result_storage/base.py`：ResultStore抽象基类
+- `src/rabbitmq_arq/result_storage/redis.py`：Redis存储实现
+- `src/rabbitmq_arq/result_storage/factory.py`：存储工厂和自动配置
+- `src/rabbitmq_arq/result_storage/url_parser.py`：URL解析和类型识别
+- `src/rabbitmq_arq/worker.py:460`：`_store_job_result()` 方法
+- `src/rabbitmq_arq/worker.py:435`：结果存储初始化逻辑
+- `src/rabbitmq_arq/client.py:193-261`：客户端查询API实现
+- `src/rabbitmq_arq/connections.py:148-150`：WorkerSettings结果存储配置
 
 ## 技术架构设计
 
@@ -371,12 +386,13 @@ s3_url = "s3://my-bucket/results/"                       # S3
 
 #### 3.3 高性能存储方案
 
-##### RedisStore (Redis存储)
+##### RedisStore (Redis存储) ✅ 已实现
 - **用途**：生产环境推荐
-- **特点**：高性能、支持TTL、支持持久化、集群支持
-- **依赖**：Redis 服务器 + aioredis 库
+- **特点**：高性能、支持TTL、支持持久化、连接池管理
+- **依赖**：Redis 服务器 + redis[hiredis] 库
 - **实现**：使用 Redis Hash + EXPIRE 命令
 - **适用场景**：中高并发生产环境
+- **配置示例**：`redis://localhost:6379/0`
 
 ##### RedisClusterStore (Redis集群存储)
 - **用途**：大规模分布式部署
@@ -1000,7 +1016,7 @@ class ResultNotFoundError(ResultStorageError):
 ```python
 worker_settings = WorkerSettings(
     enable_job_result_storage=True,
-    result_store_type="memory",  # 简单内存存储
+    job_result_store_url="redis://localhost:6379/1",  # 使用专用数据库
     job_result_ttl=3600,  # 1小时
 )
 ```
@@ -1009,14 +1025,8 @@ worker_settings = WorkerSettings(
 ```python
 worker_settings = WorkerSettings(
     enable_job_result_storage=True,
-    result_store_type="redis",
+    job_result_store_url="redis://redis-cluster:6379/0",
     job_result_ttl=86400,  # 24小时
-    result_store_config={
-        "redis_url": "redis://redis-cluster:6379/0",
-        "connection_pool_size": 20,
-        "socket_timeout": 5.0,
-        "retry_on_timeout": True,
-    }
 )
 ```
 

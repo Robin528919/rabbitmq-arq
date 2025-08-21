@@ -1,0 +1,149 @@
+# 基于标签推送的自动 Release
+name: Release on Tag
+
+on:
+  push:
+    tags:
+      - 'v*'  # 当推送 v* 格式的标签时触发
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 获取完整的 git 历史，用于生成 changelog
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install build twine
+
+    - name: Build package
+      run: |
+        python -m build
+
+    - name: Verify package
+      run: |
+        python -m twine check dist/*
+
+    - name: Get tag info
+      id: tag_info
+      run: |
+        TAG_NAME=${GITHUB_REF#refs/tags/}
+        VERSION=${TAG_NAME#v}
+        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Tag: $TAG_NAME, Version: $VERSION"
+
+    - name: Generate changelog
+      id: changelog
+      run: |
+        # 获取上一个标签
+        PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+        
+        echo "## 🚀 版本 ${{ steps.tag_info.outputs.version }} 更新内容" > changelog.md
+        echo "" >> changelog.md
+        
+        if [ -n "$PREV_TAG" ]; then
+          echo "### 📝 变更记录" >> changelog.md
+          echo "" >> changelog.md
+          
+          # 按类型分组显示提交
+          git log --pretty=format:"%s" ${PREV_TAG}..HEAD | while IFS= read -r commit; do
+            case "$commit" in
+              feat:*|feature:*)
+                echo "- 🎉 $commit" >> changelog.md
+                ;;
+              fix:*)
+                echo "- 🐛 $commit" >> changelog.md
+                ;;
+              docs:*)
+                echo "- 📚 $commit" >> changelog.md
+                ;;
+              refactor:*)
+                echo "- ♻️ $commit" >> changelog.md
+                ;;
+              test:*)
+                echo "- 🧪 $commit" >> changelog.md
+                ;;
+              chore:*|build:*)
+                echo "- 🔧 $commit" >> changelog.md
+                ;;
+              *)
+                echo "- $commit" >> changelog.md
+                ;;
+            esac
+          done
+          
+          echo "" >> changelog.md
+          echo "**完整变更**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ steps.tag_info.outputs.tag_name }}" >> changelog.md
+        else
+          echo "### 🎊 首次发布" >> changelog.md
+          echo "" >> changelog.md
+          echo "- RabbitMQ-ARQ 项目首次发布" >> changelog.md
+          echo "- 提供类似 ARQ 的简洁 API" >> changelog.md
+          echo "- 基于 RabbitMQ 的高性能异步任务队列" >> changelog.md
+        fi
+        
+        # 添加安装和使用信息
+        echo "" >> changelog.md
+        echo "## 📦 安装方式" >> changelog.md
+        echo "" >> changelog.md
+        echo "\`\`\`bash" >> changelog.md
+        echo "pip install rabbitmq-arq==${{ steps.tag_info.outputs.version }}" >> changelog.md
+        echo "\`\`\`" >> changelog.md
+        
+        # 设置输出
+        {
+          echo "changelog<<EOF"
+          cat changelog.md
+          echo "EOF"
+        } >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag_info.outputs.tag_name }}
+        name: Release ${{ steps.tag_info.outputs.tag_name }}
+        body: ${{ steps.changelog.outputs.changelog }}
+        draft: false
+        prerelease: false
+        files: |
+          dist/*
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Publish to PyPI
+      if: success()
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: |
+        if [ -n "$TWINE_PASSWORD" ]; then
+          echo "🚀 发布到 PyPI..."
+          python -m twine upload dist/* --verbose
+          echo "✅ PyPI 发布完成"
+        else
+          echo "⚠️ 跳过 PyPI 发布：未配置 PYPI_API_TOKEN"
+        fi
+
+    - name: Notify success
+      if: success()
+      run: |
+        echo "🎉 Release ${{ steps.tag_info.outputs.tag_name }} 创建成功！"
+        echo "📦 包已上传到 GitHub Release"
+        if [ -n "${{ secrets.PYPI_API_TOKEN }}" ]; then
+          echo "🐍 包已发布到 PyPI"
+        fi

@@ -46,21 +46,22 @@ async def basic_task_test(ctx: JobContext, task_name: str, data: dict):
     logger.info(f"   任务ID: {ctx.job_id}")
     logger.info(f"   数据: {data}")
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(30)
 
-    logger.info(f"✅ 基础任务 {task_name} 完成")
+    logger.info(f"✅ 基础任务 {task_name} 延迟30秒 完成")
     return {"task_name": task_name, "status": "completed", "data": data}
 
 
 async def retry_task_test(ctx: JobContext, retry_count: int = 2):
-    """重试任务测试"""
+    """重试任务测试 - ARQ 风格"""
     logger.info(f"🔄 执行重试任务测试")
     logger.info(f"   任务ID: {ctx.job_id}")
     logger.info(f"   当前尝试: {ctx.job_try}")
     logger.info(f"   预期重试: {retry_count} 次")
 
     if ctx.job_try <= retry_count:
-        logger.warning(f"💥 任务失败，进行重试 ({ctx.job_try}/{retry_count})")
+        logger.warning(f"💥 任务需要重试 ({ctx.job_try}/{retry_count})")
+        # ARQ 风格：显式抛出 Retry 异常
         raise Retry(defer=1)  # 1秒后重试
 
     logger.info(f"✅ 重试任务最终成功")
@@ -76,6 +77,39 @@ async def delayed_task_test(ctx: JobContext, message: str):
 
     logger.info(f"✅ 延迟任务完成: {message}")
     return {"message": message, "status": "completed"}
+
+
+async def error_task_test(ctx: JobContext, error_message: str = "测试错误"):
+    """错误任务测试 - ARQ 风格，抛出不可重试的异常"""
+    logger.info(f"💥 执行错误任务测试")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   错误信息: {error_message}")
+    
+    # 模拟一些处理时间
+    await asyncio.sleep(0.1)
+    
+    # ARQ 风格：抛出明确的不可重试异常
+    logger.warning(f"❌ 任务即将抛出 ValueError: {error_message}")
+    raise ValueError(error_message)  # ValueError 是不可重试的异常
+
+
+async def network_retry_task_test(ctx: JobContext, should_succeed_on_try: int = 3):
+    """网络重试任务测试 - 模拟网络错误的重试"""
+    logger.info(f"🌐 执行网络重试任务测试")
+    logger.info(f"   任务ID: {ctx.job_id}")
+    logger.info(f"   当前尝试: {ctx.job_try}")
+    logger.info(f"   预期在第 {should_succeed_on_try} 次尝试成功")
+    
+    # 模拟网络请求
+    await asyncio.sleep(0.1)
+    
+    if ctx.job_try < should_succeed_on_try:
+        logger.warning(f"🌐 模拟网络连接错误 (尝试 {ctx.job_try}/{should_succeed_on_try})")
+        # 抛出系统级错误，这些错误会自动重试
+        raise OSError(f"网络连接失败 (尝试 {ctx.job_try})")
+    
+    logger.info(f"✅ 网络任务在第 {ctx.job_try} 次尝试成功")
+    return {"success_on_try": ctx.job_try, "status": "completed"}
 
 
 # === 生命周期钩子 ===
@@ -136,7 +170,7 @@ async def job_end_hook(ctx: dict):
 # 测试 Worker 配置
 test_worker_settings = WorkerSettings(
     rabbitmq_settings=rabbitmq_settings,
-    functions=[basic_task_test, retry_task_test, delayed_task_test],
+    functions=[basic_task_test, retry_task_test, delayed_task_test, error_task_test, network_retry_task_test],
     worker_name="test_worker",
 
     # 队列配置
@@ -146,7 +180,7 @@ test_worker_settings = WorkerSettings(
     # 任务处理配置
     max_retries=3,
     retry_backoff=1.0,
-    job_timeout=30,
+    # job_timeout=30,
     max_concurrent_jobs=3,
 
     # Burst 模式配置（用于测试）
@@ -210,14 +244,30 @@ async def basic_functionality_test():
         )
         logger.info(f"✅ 延迟任务已提交: {job3.job_id}")
 
+        # 测试错误任务
+        job4 = await client.enqueue_job(
+            "error_task_test",
+            error_message="这是一个测试错误",
+            queue_name="test_queue"
+        )
+        logger.info(f"✅ 错误任务已提交: {job4.job_id}")
+
+        # 测试网络重试任务
+        job5 = await client.enqueue_job(
+            "network_retry_task_test",
+            should_succeed_on_try=3,
+            queue_name="test_queue"
+        )
+        logger.info(f"✅ 网络重试任务已提交: {job5.job_id}")
+
         logger.info("🎉 所有测试任务已提交")
 
         # 测试 ARQ 风格的任务状态和结果 API
         logger.info("📋 开始测试 ARQ 风格任务操作...")
 
         # 演示任务状态查询
-        jobs = [job1, job2, job3]
-        job_names = ["基础任务", "重试任务", "延迟任务"]
+        jobs = [job1, job2, job3, job4, job5]
+        job_names = ["基础任务", "重试任务", "延迟任务", "错误任务", "网络重试任务"]
 
         for job, name in zip(jobs, job_names):
             try:
@@ -257,6 +307,22 @@ async def basic_functionality_test():
             logger.info(f"✅ 延迟任务结果: {result3}")
         except Exception as e:
             logger.error(f"❌ 获取延迟任务结果失败: {e}")
+
+        # 错误任务结果（预期失败）
+        try:
+            logger.info(f"🔄 等待错误任务完成: {job4.job_id}")
+            result4 = await job4.result(timeout=10)
+            logger.warning(f"⚠️ 错误任务意外成功: {result4}")
+        except Exception as e:
+            logger.info(f"✅ 错误任务按预期失败: {e}")
+
+        # 网络重试任务结果
+        try:
+            logger.info(f"🔄 等待网络重试任务完成: {job5.job_id}")
+            result5 = await job5.result(timeout=15)  # 网络重试需要更长时间
+            logger.info(f"✅ 网络重试任务结果: {result5}")
+        except Exception as e:
+            logger.error(f"❌ 获取网络重试任务结果失败: {e}")
 
         # 最后再次检查所有任务的最终状态
         logger.info("🏁 检查最终任务状态...")
