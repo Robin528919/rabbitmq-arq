@@ -229,8 +229,8 @@ job = await client.enqueue_job(
 )
 
 # 延迟到具体时间
-from datetime import datetime, timedelta
-future_time = datetime.now() + timedelta(hours=24)
+from datetime import datetime, timedelta, timezone
+future_time = datetime.now(timezone.utc) + timedelta(hours=24)
 job = await client.enqueue_job(
     "daily_report",
     _defer_until=future_time  # 24小时后执行
@@ -326,6 +326,37 @@ worker_settings = WorkerSettings(
     debug_mode=False,               # 调试模式
     trace_tasks=False,              # 追踪任务执行
 )
+
+### 并发控制与预取
+
+Worker 执行并发由两部分共同决定：
+
+- `RabbitMQSettings.prefetch_count`：一次性从 Broker 预取的消息数量上限；
+- `WorkerSettings.max_concurrent_jobs`：Worker 侧使用信号量限制的实际并发执行上限。
+
+有效并发 = `min(prefetch_count, max_concurrent_jobs)`。
+
+建议：
+
+- 将 `prefetch_count` 配置为不小于 `max_concurrent_jobs`，以避免预取成为瓶颈；
+- 即使 `prefetch_count` 较大，Worker 内部的并发信号量也会限制执行并发，防止过载；
+- I/O 密集任务可适当提高两者；CPU 密集任务可降低两者并结合多进程/多实例部署。
+
+示例：
+
+```python
+rabbitmq_settings = RabbitMQSettings(
+    rabbitmq_url="amqp://guest:guest@localhost:5672/",
+    prefetch_count=100,
+)
+
+worker_settings = WorkerSettings(
+    rabbitmq_settings=rabbitmq_settings,
+    functions=[process_data],
+    max_concurrent_jobs=50,
+)
+# 实际并发约为 min(100, 50) = 50
+```
 ```
 
 ## Burst 模式
@@ -534,6 +565,29 @@ rabbitmq-arq worker -m myapp.workers:worker_settings
 rabbitmq-arq worker -m myapp.workers:task_functions --queue my_queue
 ```
 
+### 类型注解与参数重建（Pydantic V2）
+
+Worker 在执行任务前，会根据任务函数的类型注解，自动将通过 JSON 传递的 `dict/list` 恢复为对应的 Pydantic 模型或容器类型：
+
+```python
+from pydantic import BaseModel
+from rabbitmq_arq import JobContext
+
+class Payload(BaseModel):
+    id: int
+    name: str
+
+async def process(ctx: JobContext, payload: Payload, items: list[Payload] | None = None):
+    # 这里的 payload 与 items 内部元素均为 Pydantic 实例
+    ...
+```
+
+说明：
+- 支持 `BaseModel`、`list[Model]`、`dict[str, Model]`、`Optional[Model] | None` 等复杂类型；
+- 无注解或注解为 `Any` 的参数保持原样；
+- 该转换仅影响调用时的入参，不会修改消息中的原始 `args/kwargs`；
+- 任务结果存储中的 `args/kwargs` 也保持原始 JSON 结构，便于跨语言消费与回溯。
+
 ## 注意事项
 
 1. **任务函数第一个参数必须是 `ctx: JobContext`**
@@ -545,3 +599,7 @@ rabbitmq-arq worker -m myapp.workers:task_functions --queue my_queue
 ## License
 
 MIT 
+时间与时区
+
+- 所有时间字段（enqueue_time/start_time/end_time/defer_until/expires 等）统一为 UTC 时区且为带时区的 datetime。
+- 序列化使用 ISO8601（包含时区偏移）。如果传入的时间是无时区 naive 类型，系统默认按 UTC 处理。
