@@ -146,6 +146,8 @@ class WorkerSettings:
 
                  # === 任务结果配置 ===
                  enable_job_result_storage: bool = True,
+                 # 当结果存储验证失败时是否降级继续运行（仅记录日志，不存结果）
+                 job_result_store_degrade_on_failure: bool = True,
                  job_result_ttl: int = 86400,
                  job_result_store_url: str = "redis://localhost:6379/0",
 
@@ -265,6 +267,7 @@ class WorkerSettings:
 
         # === 任务结果配置 ===
         self.enable_job_result_storage = enable_job_result_storage
+        self.job_result_store_degrade_on_failure = job_result_store_degrade_on_failure
         self.job_result_ttl = job_result_ttl
         self.job_result_store_url = job_result_store_url
 
