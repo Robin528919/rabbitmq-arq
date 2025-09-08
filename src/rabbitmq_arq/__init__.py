@@ -27,7 +27,20 @@ from .models import JobModel, JobContext, JobStatus, WorkerInfo
 from .protocols import WorkerCoroutine, StartupShutdown
 from .constants import default_queue_name
 
-__version__ = "0.2.1"
+# 版本号读取：从包的元数据中读取，避免在源码中硬编码版本
+# 构建与发布时以 pyproject.toml 中的 [project].version 为单一真相
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+except Exception:  # 兼容性兜底（极少数环境）
+    _pkg_version = None
+    class PackageNotFoundError(Exception):
+        pass
+
+try:
+    __version__ = _pkg_version("rabbitmq_arq") if _pkg_version else "0.0.0"
+except PackageNotFoundError:
+    # 开发态（未安装/可编辑安装元数据缺失）时兜底
+    __version__ = "0.0.0"
 
 __all__ = [
     # Worker
