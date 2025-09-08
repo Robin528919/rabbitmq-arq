@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # 可选依赖检查
@@ -149,13 +149,13 @@ class RedisResultStore(ResultStore):
 
             # 设置过期时间
             if not job_result.expires_at:
-                job_result.expires_at = datetime.now() + timedelta(seconds=self._config.ttl)
+                job_result.expires_at = datetime.now(timezone.utc) + timedelta(seconds=self._config.ttl)
 
             # 序列化结果
             result_data = self._serialize_result(job_result)
 
             # 计算TTL（Redis EXPIRE命令需要秒数）
-            ttl_seconds = int((job_result.expires_at - datetime.now()).total_seconds())
+            ttl_seconds = int((job_result.expires_at - datetime.now(timezone.utc)).total_seconds())
             if ttl_seconds <= 0:
                 ttl_seconds = self._config.ttl  # 使用默认TTL
 
@@ -387,7 +387,7 @@ class RedisResultStore(ResultStore):
 
             if cleanup_count > 0:
                 self._update_stats_on_expire(cleanup_count)
-                self._stats.last_cleanup_at = datetime.now()
+                self._stats.last_cleanup_at = datetime.now(timezone.utc)
                 self._logger.debug(f"Redis清理完成: {cleanup_count} 个过期引用")
 
             return cleanup_count
@@ -452,7 +452,7 @@ class RedisResultStore(ResultStore):
 
             # 测试读写操作
             test_key = f"{self._config.key_prefix}:health_check"
-            test_value = f"health_check_{datetime.now().timestamp()}"
+            test_value = f"health_check_{datetime.now(timezone.utc).timestamp()}"
 
             await redis_client.setex(test_key, 60, test_value)  # 60秒过期
             retrieved_value = await redis_client.get(test_key)
