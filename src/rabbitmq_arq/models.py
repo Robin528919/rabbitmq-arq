@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -34,7 +34,7 @@ class JobModel(BaseModel):
     args: list[Any] = Field(default_factory=list, description="位置参数")
     kwargs: dict[str, Any] = Field(default_factory=dict, description="关键字参数")
     job_try: int = Field(default=1, description="任务尝试次数")
-    enqueue_time: datetime = Field(default_factory=datetime.now, description="入队时间")
+    enqueue_time: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="入队时间")
     start_time: datetime | None = Field(default=None, description="开始执行时间")
     end_time: datetime | None = Field(default=None, description="结束时间")
     status: JobStatus = Field(default=JobStatus.QUEUED, description="任务状态")
@@ -62,7 +62,7 @@ class JobModel(BaseModel):
     @field_serializer('enqueue_time', 'start_time', 'end_time', 'defer_until', 'expires')
     def serialize_datetime(self, value: datetime | None) -> str | None:
         """序列化 datetime 字段为 ISO 格式字符串"""
-        return value.isoformat() if value else None
+        return value.astimezone(timezone.utc).isoformat() if value else None
 
 
 class JobContext(BaseModel):
@@ -90,7 +90,7 @@ class WorkerInfo(BaseModel):
     jobs_failed: int = Field(default=0, description="失败的任务数")
     jobs_retried: int = Field(default=0, description="重试的任务数")
     jobs_ongoing: int = Field(default=0, description="正在执行的任务数")
-    last_health_check: datetime = Field(default_factory=datetime.now, description="最后健康检查时间")
+    last_health_check: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="最后健康检查时间")
 
     model_config = ConfigDict(
         from_attributes=True,
@@ -100,4 +100,4 @@ class WorkerInfo(BaseModel):
     @field_serializer('start_time', 'last_health_check')
     def serialize_datetime(self, value: datetime) -> str:
         """序列化 datetime 字段为 ISO 格式字符串"""
-        return value.isoformat() 
+        return value.astimezone(timezone.utc).isoformat()
