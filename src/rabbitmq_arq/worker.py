@@ -14,12 +14,16 @@ import signal
 import traceback
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import partial
+import inspect
+from typing import get_type_hints
 from signal import Signals
 from typing import Any
 
 from aio_pika import connect_robust, IncomingMessage, Message
+from aio_pika.abc import AbstractConnection, AbstractChannel
+from pydantic import TypeAdapter
 
 from .connections import WorkerSettings
 from .exceptions import Retry, JobTimeout, MaxRetriesExceeded, RabbitMQConnectionError
@@ -31,6 +35,9 @@ from .result_storage.models import JobResult
 from .result_storage.url_parser import parse_store_type_from_url
 
 logger = logging.getLogger('rabbitmq-arq.worker')
+
+# TypeAdapter 简易缓存，减少重复构建开销
+_TYPE_ADAPTER_CACHE: dict[str, TypeAdapter] = {}
 
 
 # 错误分类定义
@@ -119,7 +126,7 @@ class WorkerUtils:
         self.worker_id = uuid.uuid4().hex
         self.worker_info = WorkerInfo(
             worker_id=self.worker_id,
-            start_time=datetime.now()
+            start_time=datetime.now(timezone.utc)
         )
 
         # 信号处理相关属性
@@ -130,9 +137,9 @@ class WorkerUtils:
         self._burst_should_exit = False
 
         # 连接相关属性 - 子类会覆盖这些默认值
-        self.connection: Any = None  # aio_pika.Connection
-        self.channel: Any = None  # aio_pika.Channel
-        self.dlq_channel: Any = None  # aio_pika.Channel
+        self.connection: AbstractConnection | None = None
+        self.channel: AbstractChannel | None = None
+        self.dlq_channel: AbstractChannel | None = None
 
         # 设置信号处理器的标志，子类可以控制是否启用
         self._signal_handlers_enabled = False
@@ -199,7 +206,7 @@ class WorkerUtils:
         """
         等待任务完成，直到达到 `wait_for_job_completion_on_signal_second`。
         """
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
         initial_tasks = len(self.tasks)
         # 使用worker_settings中的配置，如果没有则使用默认值
         timeout = (getattr(self.worker_settings, 'wait_for_job_completion_on_signal_second', None)
@@ -212,10 +219,10 @@ class WorkerUtils:
                 self._sleep_until_tasks_complete(),
                 timeout,
             )
-            elapsed = (datetime.now() - start_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             logger.info(f'✅ 所有任务已完成，用时 {elapsed:.2f} 秒')
         except asyncio.TimeoutError:
-            elapsed = (datetime.now() - start_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             remaining_tasks = len(self.tasks)
             completed_tasks = initial_tasks - remaining_tasks
 
@@ -396,7 +403,7 @@ class Worker(WorkerUtils):
         self.worker_id = worker_settings.worker_name or f"worker_{uuid.uuid4().hex[:8]}"
         self.worker_info = WorkerInfo(
             worker_id=self.worker_id,
-            start_time=datetime.now()
+            start_time=datetime.now(timezone.utc)
         )
 
         # Burst 模式相关（覆盖父类默认值）
@@ -419,7 +426,26 @@ class Worker(WorkerUtils):
         self.result_store: ResultStore | None = None
         self._init_result_store()
 
+        # 并发控制（与 prefetch 协同）：最大并发任务数
+        self._job_semaphore: asyncio.Semaphore | None = None
+        try:
+            mcj = getattr(self.worker_settings, 'max_concurrent_jobs', None)
+            if isinstance(mcj, int) and mcj > 0:
+                self._job_semaphore = asyncio.Semaphore(mcj)
+        except Exception:
+            # 若配置异常则不启用并发限制
+            self._job_semaphore = None
+
         # 信号处理器将在 main() 方法中设置，因为此时事件循环还没有运行
+
+    @staticmethod
+    def _ensure_aware_utc(dt: datetime | None) -> datetime | None:
+        """将 datetime 统一为带时区(UTC)。若传入为 naive，则假定为 UTC。"""
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
 
     def _init_result_store(self) -> None:
         """初始化结果存储"""
@@ -441,6 +467,10 @@ class Worker(WorkerUtils):
         """验证结果存储连接"""
         if not self.result_store:
             logger.error("⚠️ 未配置结果存储，任务结果将不会被保存")
+            # 根据配置决定是否允许降级
+            if getattr(self.worker_settings, 'job_result_store_degrade_on_failure', True):
+                logger.warning("⚠️ 结果存储未配置：启用降级模式（不保存结果）")
+                return
             raise RuntimeError("结果存储未配置")
         
         try:
@@ -456,8 +486,12 @@ class Worker(WorkerUtils):
         except Exception as e:
             store_type = parse_store_type_from_url(self.worker_settings.job_result_store_url)
             logger.error(f"❌ 结果存储连接验证失败 ({store_type}): {e}")
-            
-            # 直接抛出异常，这是严重错误 - 简化错误信息避免重复
+            # 根据配置决定是否降级
+            if getattr(self.worker_settings, 'job_result_store_degrade_on_failure', True):
+                logger.warning("⚠️ 启用降级模式：禁用结果存储并继续运行")
+                self.result_store = None
+                return
+            # 否则抛出异常阻止启动
             raise RuntimeError(f"结果存储 ({store_type}) 连接失败，Worker 无法启动") from e
 
     async def _store_job_result(self, job: JobModel) -> None:
@@ -589,21 +623,36 @@ class Worker(WorkerUtils):
                 client_delayed = headers.get("x-client-delayed") == "true"
 
                 # 只有非客户端延迟任务才需要检查延迟执行时间
-                if not client_delayed and job.defer_until and job.defer_until > datetime.now():
-                    delay_seconds = (job.defer_until - datetime.now()).total_seconds()
-                    logger.info(f"任务 {job_id} 需要延迟 {delay_seconds:.1f} 秒执行，发送到延迟队列")
-                    # 发送到延迟队列，不阻塞当前处理
-                    await self._send_to_delay_queue(job, delay_seconds)
-                    return
+                if not client_delayed and job.defer_until:
+                    now_utc = datetime.now(timezone.utc)
+                    defer_dt = self._ensure_aware_utc(job.defer_until)
+                    if defer_dt and defer_dt > now_utc:
+                        delay_seconds = (defer_dt - now_utc).total_seconds()
+                        logger.info(f"任务 {job_id} 需要延迟 {delay_seconds:.1f} 秒执行，发送到延迟队列")
+                        # 发送到延迟队列，不阻塞当前处理
+                        await self._send_to_delay_queue(job, delay_seconds)
+                        return
                 elif client_delayed:
                     logger.debug(f"任务 {job_id} 已由客户端处理延迟，直接执行")
 
-                # 创建任务并执行
-                task = asyncio.create_task(self._execute_job(job))
-                self.tasks[job_id] = task
+                # 创建任务并执行（受并发限制）
+                acquired = False
+                try:
+                    if self._job_semaphore is not None:
+                        await self._job_semaphore.acquire()
+                        acquired = True
 
-                # 等待任务完成
-                await task
+                    task = asyncio.create_task(self._execute_job(job))
+                    self.tasks[job_id] = task
+
+                    # 等待任务完成
+                    await task
+                finally:
+                    if acquired:
+                        try:
+                            self._job_semaphore.release()
+                        except Exception:
+                            pass
 
             except json.JSONDecodeError as e:
                 logger.error(f"消息解析失败: {e}\n{message.body}")
@@ -640,7 +689,7 @@ class Worker(WorkerUtils):
                 # 发送到延迟队列进行重试
                 if job_id and job:
                     await self._send_to_delay_queue(job, delay_seconds, new_retry_count)
-                    logger.info(
+                    logger.debug(
                         f"任务 {job_id} 第 {new_retry_count} 次重试，延迟 {delay_seconds:.1f} 秒 (错误类型: {type(e).__name__}, 分类: {error_category})")
 
             finally:
@@ -652,7 +701,7 @@ class Worker(WorkerUtils):
         """
         执行单个任务
         """
-        job.start_time = datetime.now()
+        job.start_time = datetime.now(timezone.utc)
         job.status = JobStatus.IN_PROGRESS
         self.worker_info.jobs_ongoing = len(self.tasks)
 
@@ -681,33 +730,36 @@ class Worker(WorkerUtils):
                 await self.on_job_start(hook_ctx)
 
             # 获取要执行的函数
-            func = self.functions_map.get(job.function)  # type: WorkerCoroutine
+            func = self.functions.get(job.function)  # type: WorkerCoroutine
             if not func:
                 logger.error(f"未找到函数: {job.function}")
-                logger.error(f"可用函数列表: {list(self.functions_map.keys())}")
-                logger.error(f"functions_map 类型: {type(self.functions_map)}")
+                logger.error(f"可用函数列表: {list(self.functions.keys())}")
                 raise ValueError(f"未找到函数: {job.function}")
 
+            # 在调用任务函数前，基于函数的类型注解将 JSON 反序列化后的 dict/list
+            # 自动重建为 Pydantic 模型或相应容器类型（不修改原始 job.args/kwargs）
+            coerced_args, coerced_kwargs = self._coerce_task_args(func, job.args, job.kwargs)
+
             # 执行函数（带超时控制）
-            logger.info(f"开始执行任务 {job.job_id} - {job.function}")
+            logger.debug(f"开始执行任务 {job.job_id} - {job.function}")
 
             if asyncio.iscoroutinefunction(func):
                 result = await asyncio.wait_for(
-                    func(job_ctx, *job.args, **job.kwargs),
+                    func(job_ctx, *coerced_args, **coerced_kwargs),
                     timeout=self.worker_settings.job_timeout
                 )
             else:
                 # 同步函数在线程池中执行
                 loop = asyncio.get_running_loop()
                 result = await asyncio.wait_for(
-                    loop.run_in_executor(None, partial(func, job_ctx, *job.args, **job.kwargs)),
+                    loop.run_in_executor(None, partial(func, job_ctx, *coerced_args, **coerced_kwargs)),
                     timeout=self.worker_settings.job_timeout
                 )
 
             # 任务成功完成
             job.status = JobStatus.COMPLETED
             job.result = result
-            job.end_time = datetime.now()
+            job.end_time = datetime.now(timezone.utc)
             self.jobs_complete += 1
 
             logger.info(f"任务 {job.job_id} 执行成功，耗时 {(job.end_time - job.start_time).total_seconds():.2f} 秒")
@@ -720,7 +772,7 @@ class Worker(WorkerUtils):
         except asyncio.TimeoutError:
             job.status = JobStatus.FAILED
             job.error = f"任务执行超时 ({self.worker_settings.job_timeout}秒)"
-            job.end_time = datetime.now()
+            job.end_time = datetime.now(timezone.utc)
             self.jobs_failed += 1
             logger.error(f"任务 {job.job_id} 执行超时")
             # 存储失败结果
@@ -741,7 +793,7 @@ class Worker(WorkerUtils):
                 logger.error(f"任务 {job.job_id} 已达到最大重试次数 {self.worker_settings.max_retries}，发送到死信队列")
                 job.status = JobStatus.FAILED
                 job.error = f"任务超过最大重试次数 {self.worker_settings.max_retries}"
-                job.end_time = datetime.now()
+                job.end_time = datetime.now(timezone.utc)
                 # 存储最终失败结果
                 await self._store_job_result(job)
                 return  # 直接返回，不再重试
@@ -763,7 +815,7 @@ class Worker(WorkerUtils):
         except Exception as e:
             job.status = JobStatus.FAILED
             job.error = f"{type(e).__name__}: {str(e)}"
-            job.end_time = datetime.now()
+            job.end_time = datetime.now(timezone.utc)
             self.jobs_failed += 1
             logger.error(f"任务 {job.job_id} 执行失败: {job.error}\n{traceback.format_exc()}")
 
@@ -775,7 +827,7 @@ class Worker(WorkerUtils):
             raise
 
         finally:
-            job.end_time = datetime.now()
+            job.end_time = datetime.now(timezone.utc)
 
             # 调用 on_job_end 钩子
             if self.on_job_end:
@@ -812,6 +864,79 @@ class Worker(WorkerUtils):
             self.worker_info.jobs_retried = self.jobs_retried
             self.worker_info.jobs_ongoing = len(self.tasks)
 
+    def _coerce_task_args(self, func: WorkerCoroutine, args: list[Any], kwargs: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+        """
+        基于任务函数的类型注解，将 JSON 反序列化后的参数恢复为 Pydantic 模型或容器类型。
+        仅用于调用时的参数转换，不修改原始 job.args/kwargs。
+
+        Args:
+            func: 任务函数
+            args: 位置参数列表（不包含 ctx）
+            kwargs: 关键字参数字典
+
+        Returns:
+            (coerced_args, coerced_kwargs): 转换后的参数
+        """
+        try:
+            # 提取类型注解（解析前向引用、跨模块）
+            type_hints = get_type_hints(func, globalns=getattr(func, "__globals__", None))
+        except Exception:
+            type_hints = {}
+
+        try:
+            params = list(inspect.signature(func).parameters.values())
+        except Exception:
+            params = []
+
+        # 跳过第一个 ctx 参数，构造位置参数名序列
+        positional_param_names: list[str] = [p.name for p in params[1:]] if params else []
+
+        # 处理位置参数
+        coerced_args: list[Any] = []
+        for idx, value in enumerate(args):
+            if idx < len(positional_param_names):
+                name = positional_param_names[idx]
+                annotation = type_hints.get(name, params[idx + 1].annotation if params else inspect._empty)
+            else:
+                annotation = inspect._empty
+
+            coerced_args.append(self._coerce_single_value(value, annotation))
+
+        # 处理关键字参数
+        coerced_kwargs: dict[str, Any] = {}
+        for k, v in kwargs.items():
+            annotation = type_hints.get(k, inspect._empty)
+            coerced_kwargs[k] = self._coerce_single_value(v, annotation)
+
+        return coerced_args, coerced_kwargs
+
+    @staticmethod
+    def _get_type_adapter(annotation: Any) -> TypeAdapter | None:
+        """获取或创建注解对应的 TypeAdapter，带本地缓存。"""
+        try:
+            key = repr(annotation)
+            adapter = _TYPE_ADAPTER_CACHE.get(key)
+            if adapter is None:
+                adapter = TypeAdapter(annotation)
+                _TYPE_ADAPTER_CACHE[key] = adapter
+            return adapter
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_single_value(value: Any, annotation: Any) -> Any:
+        """
+        使用 Pydantic TypeAdapter 按注解将值转换为目标类型；失败则原样返回。
+        支持 BaseModel 以及 list[Model]、dict[str, Model]、Optional[Model] 等容器/联合类型。
+        """
+        if annotation in (None, inspect._empty) or annotation is Any:
+            return value
+        try:
+            adapter = Worker._get_type_adapter(annotation)
+            return adapter.validate_python(value) if adapter else value
+        except Exception:
+            return value
+
     async def _enqueue_job_retry(self, job: JobModel, defer_seconds: float) -> None:
         """
         重新入队任务进行重试，使用延迟队列
@@ -829,7 +954,7 @@ class Worker(WorkerUtils):
         # 使用延迟队列进行重试
         await self._send_to_delay_queue(job, defer_seconds)
 
-        logger.info(f"任务 {job.job_id} 已发送到延迟队列进行重试，将在 {defer_seconds:.1f} 秒后执行 (重试次数: {retry_count})")
+        logger.debug(f"任务 {job.job_id} 已发送到延迟队列进行重试，将在 {defer_seconds:.1f} 秒后执行 (重试次数: {retry_count})")
 
     async def _send_to_dlq(self, body: bytes, headers: dict[str, Any]) -> None:
         """
@@ -856,7 +981,7 @@ class Worker(WorkerUtils):
             'x-error-type': type(error).__name__,
             'x-error-message': str(error),
             'x-error-category': ErrorClassification.get_error_category(error),
-            'x-failed-at': datetime.now().isoformat(),
+            'x-failed-at': datetime.now(timezone.utc).isoformat(),
             'x-job-id': job_id or 'unknown'
         })
 
@@ -910,7 +1035,7 @@ class Worker(WorkerUtils):
                 routing_key=self.rabbitmq_queue
             )
 
-            logger.info(f"任务 {job.job_id} 已通过延迟交换机发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {actual_retry_count})")
+            logger.debug(f"任务 {job.job_id} 已通过延迟交换机发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {actual_retry_count})")
 
         else:
             # 使用 TTL + DLX 方案（降级方案）
@@ -926,7 +1051,7 @@ class Worker(WorkerUtils):
                 routing_key=self._delay_queue_name
             )
 
-            logger.info(f"任务 {job.job_id} 已通过 TTL 队列发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {retry_count})")
+            logger.debug(f"任务 {job.job_id} 已通过 TTL 队列发送，将在 {delay_seconds:.1f} 秒后处理 (重试次数: {actual_retry_count})")
 
     async def _setup_delay_mechanism(self) -> None:
         """
@@ -996,7 +1121,7 @@ class Worker(WorkerUtils):
         """
         while self.allow_pick_jobs:
             try:
-                self.worker_info.last_health_check = datetime.now()
+                self.worker_info.last_health_check = datetime.now(timezone.utc)
                 # 健康检查：可以扩展添加更多检查逻辑（如 Redis 心跳等）
                 logger.debug(f"健康检查 - Worker {self.worker_id} 正常运行")
                 await asyncio.sleep(self.worker_settings.health_check_interval)
@@ -1035,7 +1160,7 @@ class Worker(WorkerUtils):
 
         # 检查超时
         if self._burst_start_time:
-            elapsed = (datetime.now() - self._burst_start_time).total_seconds()
+            elapsed = (datetime.now(timezone.utc) - self._burst_start_time).total_seconds()
             if elapsed >= self.worker_settings.burst_timeout:
                 logger.info(f"🕐 Burst 模式超时 ({elapsed:.1f}s >= {self.worker_settings.burst_timeout}s)，准备退出")
                 return True
@@ -1064,7 +1189,7 @@ class Worker(WorkerUtils):
             return
 
         logger.info(f"🚀 启动 Burst 模式监控 (超时: {self.worker_settings.burst_timeout}s)")
-        self._burst_start_time = datetime.now()
+        self._burst_start_time = datetime.now(timezone.utc)
 
         while self.allow_pick_jobs and not self._burst_should_exit:
             try:
@@ -1170,7 +1295,7 @@ class Worker(WorkerUtils):
         """
         Worker 主函数
         """
-        start_time = datetime.now()
+        start_time = datetime.now(timezone.utc)
 
         try:
 
@@ -1185,8 +1310,9 @@ class Worker(WorkerUtils):
             # 初始化连接
             await self._init()
 
-            # 验证结果存储连接
-            await self._validate_result_store()
+            # 验证结果存储连接（可配置降级或跳过）
+            if getattr(self.worker_settings, 'enable_job_result_storage', True):
+                await self._validate_result_store()
 
             # 启动钩子
             if self.on_startup:
@@ -1204,7 +1330,7 @@ class Worker(WorkerUtils):
         except asyncio.CancelledError:
             if self._burst_mode:
                 # 计算运行时间和统计信息
-                elapsed = (datetime.now() - start_time).total_seconds()
+                elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
                 logger.info(f"🏁 Burst 模式正常结束 (运行时间: {elapsed:.1f}s)")
                 logger.info(f"📊 任务统计: 完成 {self.jobs_complete} 个, "
                             f"失败 {self.jobs_failed} 个, "
