@@ -233,14 +233,14 @@ class ResultStore(ABC):
     
     def _update_stats_on_error(self, operation: str) -> None:
         """更新错误统计"""
-        from datetime import datetime
+        from datetime import datetime, timezone
         
         if operation in ('store', 'delete'):
             self._stats.storage_errors += 1
         elif operation in ('retrieve', 'get'):
             self._stats.retrieval_errors += 1
         
-        self._stats.last_error_at = datetime.now()
+        self._stats.last_error_at = datetime.now(timezone.utc)
     
     def __str__(self) -> str:
         """存储后端的字符串表示"""
