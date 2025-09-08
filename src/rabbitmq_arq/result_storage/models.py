@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
@@ -28,7 +28,7 @@ class JobResult(BaseModel):
     worker_id: str = Field(..., description="执行的 Worker ID")
     queue_name: str = Field(..., description="队列名称")
     retry_count: int = Field(default=0, description="重试次数")
-    created_at: datetime = Field(default_factory=datetime.now, description="创建时间")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="创建时间")
     expires_at: datetime | None = Field(default=None, description="过期时间")
     
     # 扩展元数据
@@ -70,7 +70,7 @@ class JobResult(BaseModel):
     @field_serializer('start_time', 'end_time', 'created_at', 'expires_at')
     def serialize_datetime(self, value: datetime | None) -> str | None:
         """序列化 datetime 字段为 ISO 格式字符串"""
-        return value.isoformat() if value else None
+        return value.astimezone(timezone.utc).isoformat() if value else None
     
     def __str__(self) -> str:
         """用户友好的字符串表示"""
@@ -135,7 +135,7 @@ class ResultStorageStats(BaseModel):
     @field_serializer('last_cleanup_at', 'last_error_at')
     def serialize_datetime(self, value: datetime | None) -> str | None:
         """序列化 datetime 字段"""
-        return value.isoformat() if value else None
+        return value.astimezone(timezone.utc).isoformat() if value else None
     
     @property
     def success_rate(self) -> float:
