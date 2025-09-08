@@ -1453,38 +1453,15 @@ class Worker(WorkerUtils):
         logger.info('✅ Worker 优雅关闭完成')
 
     @classmethod
-    def run(cls, worker_settings: WorkerSettings):
+    def run(cls, worker_settings: WorkerSettings) -> None:
         """
-        运行 Worker 的类方法
-        
+        同步启动 Worker，仅接受 WorkerSettings 实例。
+
         Args:
-            worker_settings: WorkerSettings 类或对象，包含 Worker 配置
+            worker_settings: Worker 配置对象（必须为 WorkerSettings 实例）
         """
-        # 从 settings 中提取配置
-        settings_dict = {}
+        if not isinstance(worker_settings, WorkerSettings):
+            raise TypeError("Worker.run 仅接受 WorkerSettings 实例")
 
-        # 定义 Worker.__init__ 接受的有效参数
-        valid_params = {
-            'functions', 'rabbitmq_settings', 'on_startup', 'on_shutdown',
-            'on_job_start', 'on_job_end', 'after_job_end', 'ctx'
-        }
-
-        # 获取配置属性
-        if hasattr(worker_settings, '__dict__'):
-            # 实例对象
-            for attr, value in worker_settings.__dict__.items():
-                if attr in valid_params:
-                    settings_dict[attr] = value
-        else:
-            # 类
-            for attr in dir(worker_settings):
-                if attr in valid_params:
-                    value = getattr(worker_settings, attr)
-                    if not callable(value):
-                        settings_dict[attr] = value
-
-        # 创建 Worker 实例
-        worker = cls(**settings_dict)
-
-        # 运行
+        worker = cls(worker_settings)
         asyncio.run(worker.main())
