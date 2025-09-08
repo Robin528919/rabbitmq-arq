@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aio_pika import connect_robust, Message, RobustConnection, Channel
@@ -359,24 +359,24 @@ class RabbitMQClient:
         # 计算延迟执行时间
         defer_until = None
         if _defer_until:
-            defer_until = _defer_until
+            defer_until = _defer_until if _defer_until.tzinfo is not None else _defer_until.replace(tzinfo=timezone.utc)
         elif _defer_by:
             if isinstance(_defer_by, timedelta):
-                defer_until = datetime.now() + _defer_by
+                defer_until = datetime.now(timezone.utc) + _defer_by
             else:
-                defer_until = datetime.now() + timedelta(seconds=float(_defer_by))
+                defer_until = datetime.now(timezone.utc) + timedelta(seconds=float(_defer_by))
 
         # 计算过期时间
         if _expires:
             if isinstance(_expires, (int, float)):
-                expires_time = datetime.now() + timedelta(seconds=float(_expires))
+                expires_time = datetime.now(timezone.utc) + timedelta(seconds=float(_expires))
             elif isinstance(_expires, timedelta):
-                expires_time = datetime.now() + _expires
+                expires_time = datetime.now(timezone.utc) + _expires
             else:
                 expires_time = _expires
         else:
             # 默认 24 小时过期
-            expires_time = datetime.now() + timedelta(hours=24)
+            expires_time = datetime.now(timezone.utc) + timedelta(hours=24)
 
         # 创建任务对象
         job = JobModel(
@@ -398,8 +398,8 @@ class RabbitMQClient:
             raise SerializationError(f"任务序列化失败: {e}")
 
         # 检查是否需要延迟执行
-        if defer_until and defer_until > datetime.now():
-            delay_seconds = (defer_until - datetime.now()).total_seconds()
+        if defer_until and defer_until > datetime.now(timezone.utc):
+            delay_seconds = (defer_until - datetime.now(timezone.utc)).total_seconds()
 
             # 为延迟任务添加标记，避免 Worker 重复处理延迟
             headers = {"x-retry-count": 0, "x-client-delayed": "true"}
